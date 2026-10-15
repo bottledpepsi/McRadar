@@ -1,0 +1,5 @@
+Main-Class: mcradar.Attach
+Agent-Class: mcradar.Agent
+Premain-Class: mcradar.Agent
+Can-Redefine-Classes: false
+Can-Retransform-Classes: false
