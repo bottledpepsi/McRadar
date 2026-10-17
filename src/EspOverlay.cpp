@@ -1,0 +1,434 @@
+#include "EspOverlay.h"
+#include "FriendList.h"
+#include "Logger.h"
+#include "Presets.h"
+#include "ProfileManager.h"
+#include <dwmapi.h>
+#include <algorithm>
+#include <cstdio>
+#include <timeapi.h>
+
+using namespace std::chrono_literals;
+
+namespace
+{
+    constexpr wchar_t kClass[] = L"ExternalEspOverlay";
+    constexpr auto kExitHold = 3s;
+} // namespace
+
+EspOverlay::EspOverlay(const AppOptions& opt)
+    : opt_(opt),
+      ui_(settings_),
+      udp_(opt.port),
+      injector_(InjectorConfig{opt.jarPath, opt.javaPath, opt.port, opt.agentHz}),
+      sup_(opt_, udp_, injector_)
+{
+}
+
+EspOverlay::~EspOverlay()
+{
+    if (hwnd_&& IsWindow(hwnd_)) DestroyWindow(hwnd_);
+}
+
+// ------------------------------------------------------------------------------------------------ window
+
+bool EspOverlay::CreateOverlayWindow()
+{
+    WNDCLASSEXW wc{};
+    wc.cbSize = sizeof wc;
+    wc.lpfnWndProc = &EspOverlay::WndProc;
+    wc.hInstance = GetModuleHandleW(nullptr);
+    wc.hCursor = LoadCursorW(nullptr, MAKEINTRESOURCEW(32512) /* IDC_ARROW */);
+    wc.lpszClassName = kClass;
+    if (!RegisterClassExW(&wc) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS)
+    {
+        LOG_ERROR("RegisterClassEx failed (%lu)", static_cast<unsigned long>(GetLastError()));
+        return false;
+    }
+    // WS_EX_LAYERED     : per-pixel alpha via UpdateLayeredWindow
+    // WS_EX_TRANSPARENT : mouse clicks fall through to the game (removed while the config window is open)
+    // WS_EX_TOPMOST     : stays above the game
+    // WS_EX_TOOLWINDOW  : no taskbar button / Alt-Tab entry
+    // WS_EX_NOACTIVATE  : never steals keyboard focus from the game (removed while the config window is open)
+    hwnd_ = CreateWindowExW(WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+                            kClass, L"external-esp", WS_POPUP, 0, 0, 1, 1, nullptr, nullptr, wc.hInstance, this);
+    if (!hwnd_)
+    {
+        LOG_ERROR("CreateWindowEx failed (%lu)", static_cast<unsigned long>(GetLastError()));
+        return false;
+    }
+    clickThrough_ = true;
+    return true;
+}
+
+LRESULT CALLBACK EspOverlay::WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
+{
+    EspOverlay * self = nullptr;
+    if (m == WM_NCCREATE)
+    {
+        self = static_cast<EspOverlay*>(reinterpret_cast<CREATESTRUCTW*>(l)->lpCreateParams);
+        SetWindowLongPtrW(h, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(self));
+    }
+    else
+    {
+        self = reinterpret_cast<EspOverlay*>(GetWindowLongPtrW(h, GWLP_USERDATA));
+    }
+    return self ? self->OnMessage(h, m, w, l) : DefWindowProcW(h, m, w, l);
+}
+
+LRESULT EspOverlay::OnMessage(HWND h, UINT m, WPARAM w, LPARAM l)
+{
+    switch (m)
+    {
+    case WM_ERASEBKGND: return 1;
+    case WM_MOUSEACTIVATE: return configOpen_ ? MA_ACTIVATE : MA_NOACTIVATE;
+    case WM_SETCURSOR:
+        if (configOpen_)
+        {
+            SetCursor(LoadCursorW(nullptr, MAKEINTRESOURCEW(32512)));
+            return TRUE;
+        }
+        break;
+    case WM_MOUSEMOVE:
+        pend_.mx = static_cast<float>(static_cast<short>(LOWORD(l)));
+        pend_.my = static_cast<float>(static_cast<short>(HIWORD(l)));
+        return 0;
+    case WM_LBUTTONDOWN:
+        SetCapture(h); // keep receiving moves while dragging the panel
+        pend_.down = true;
+        pend_.pressed = true;
+        return 0;
+    case WM_LBUTTONUP:
+        ReleaseCapture();
+        pend_.down = false;
+        pend_.released = true;
+        return 0;
+    case WM_RBUTTONDOWN: pend_.rpressed = true;
+        return 0;
+    case WM_MOUSEWHEEL: pend_.wheel += static_cast<float>(GET_WHEEL_DELTA_WPARAM(w)) / static_cast<float>(WHEEL_DELTA);
+        return 0;
+    case WM_CHAR:
+        if (configOpen_&& w>= 32 && w < 127) pend_.chars.push_back(static_cast<char>(w));
+        return 0;
+    case WM_KEYDOWN:
+    case WM_SYSKEYDOWN:
+        if (configOpen_) pend_.keys.push_back(static_cast<int>(w));
+        return 0;
+    case WM_CLOSE: DestroyWindow(h);
+        return 0;
+    case WM_DESTROY: quit_ = true;
+        PostQuitMessage(0);
+        return 0;
+    default: break;
+    }
+    return DefWindowProcW(h, m, w, l);
+}
+
+void EspOverlay::SetClickThrough(bool on)
+{
+    if (!hwnd_ || on == clickThrough_) return;
+    LONG_PTR ex = GetWindowLongPtrW(hwnd_, GWL_EXSTYLE);
+    if (on) ex |= (WS_EX_TRANSPARENT | WS_EX_NOACTIVATE);
+    else ex &= ~static_cast<LONG_PTR>(WS_EX_TRANSPARENT | WS_EX_NOACTIVATE);
+    SetWindowLongPtrW(hwnd_, GWL_EXSTYLE, ex);
+    SetWindowPos(hwnd_, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+    clickThrough_ = on;
+}
+
+// SetForegroundWindow is restricted for background processes; briefly attaching to the foreground
+// thread's input queue is the standard workaround.
+void EspOverlay::ForceForeground(HWND h)
+{
+    HWND fg = GetForegroundWindow();
+    const DWORD fgThread = fg ? GetWindowThreadProcessId(fg, nullptr) : 0, me = GetCurrentThreadId();
+    if (fgThread && fgThread != me) AttachThreadInput(me, fgThread, TRUE);
+    SetForegroundWindow(h);
+    SetFocus(h);
+    if (fgThread && fgThread != me) AttachThreadInput(me, fgThread, FALSE);
+}
+
+void EspOverlay::SetShown(bool show)
+{
+    if (show == shown_ || !hwnd_) return;
+    if (show)
+    {
+        ShowWindow(hwnd_, SW_SHOWNOACTIVATE);
+        SetWindowPos(hwnd_, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    }
+    else
+    {
+        ShowWindow(hwnd_, SW_HIDE);
+    }
+    shown_ = show;
+}
+
+void EspOverlay::OpenConfig()
+{
+    configOpen_ = true;
+    configOpenedAt_ = Clock::now();
+    pend_ = UiInput{};
+    ui_.ResetFocus();
+    ProfileManager::Refresh();
+    SetShown(true);
+    SetClickThrough(false); // the window now receives the mouse
+    ForceForeground(hwnd_); // ...and keyboard focus (text fields, rebinding)
+}
+
+void EspOverlay::CloseConfig()
+{
+    configOpen_ = false;
+    ui_.ResetFocus();
+    SetClickThrough(true);
+    pend_ = UiInput{};
+    HWND mc = sup_.GameWindow();
+    if (mc && IsWindow(mc)) SetForegroundWindow(mc); // hand focus back to the game
+}
+
+// ------------------------------------------------------------------------------------------------ input
+
+bool EspOverlay::KeyEdge(int vk)
+{
+    const bool down = (GetAsyncKeyState(vk) & 0x8000) != 0;
+    bool& prev = prevKeys_[vk];
+    const bool edge = down && !prev;
+    prev = down;
+    return edge;
+}
+
+void EspOverlay::HandleHotkeys(bool focused)
+{
+    if (!focused || ui_.CapturingKeys())
+    {
+        // global hotkeys only act while the game/overlay has focus
+        exitHolding_ = false;
+        // keep edge state fresh so a key held while unfocused does not fire on return
+        KeyEdge(settings_.vkToggle);
+        KeyEdge(settings_.vkConfig);
+        return;
+    }
+    if (KeyEdge(settings_.vkToggle))
+    {
+        visible_ = !visible_;
+        LOG_INFO("ESP %s", visible_ ? "shown" : "hidden");
+    }
+    if (KeyEdge(settings_.vkConfig))
+    {
+        if (configOpen_) CloseConfig();
+        else OpenConfig();
+    }
+
+    const bool exitDown = (GetAsyncKeyState(settings_.vkExit) & 0x8000) != 0;
+    if (exitDown)
+    {
+        if (!exitHolding_)
+        {
+            exitHolding_ = true;
+            exitHoldStart_ = Clock::now();
+        }
+        else if (Clock::now() - exitHoldStart_ >= kExitHold)
+        {
+            LOG_INFO("Exit hotkey held - shutting down.");
+            quit_ = true;
+        }
+    }
+    else
+    {
+        exitHolding_ = false;
+    }
+}
+
+// ------------------------------------------------------------------------------------------------ geometry / pacing
+
+bool EspOverlay::GameGeometry(RECT& r) const
+{
+    if (opt_.demo || opt_.screenOverlay)
+    {
+        r = RECT{0, 0, GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN)};
+        return true;
+    }
+    HWND mc = sup_.GameWindow();
+    if (!mc || !IsWindow(mc) || IsIconic(mc)) return false;
+    RECT rc{};
+    GetClientRect(mc, &rc);
+    POINT p{0, 0};
+    ClientToScreen(mc, &p); // client origin in screen space (excludes title bar / borders)
+    r = RECT{p.x, p.y, p.x + rc.right, p.y + rc.bottom};
+    return rc.right > 16 && rc.bottom > 16;
+}
+
+void EspOverlay::Pace(Clock::time_point frameStart)
+{
+    int cap = presets::FpsCaps[settings_.fpsCap];
+    if (cap == 0 && !settings_.vsync) cap = 240; // never spin a core flat out
+    if (cap <= 0) return; // unlimited + VSync: DwmFlush already paces us
+    const auto target = frameStart + std::chrono::microseconds(1'000'000 / cap);
+    for (;;)
+    {
+        const auto now = Clock::now();
+        if (now >= target) break;
+        if (target - now > 2ms) Sleep(1);
+        else SwitchToThread();
+    }
+}
+
+// ------------------------------------------------------------------------------------------------ main loop
+
+int EspOverlay::Run()
+{
+    settings_.Load();
+    if (!gfx_.Init())
+    {
+        LOG_ERROR("Direct2D/DirectWrite initialisation failed.");
+        return 1;
+    }
+    if (!CreateOverlayWindow()) return 1;
+    if (!opt_.demo && !udp_.Start()) LOG_ERROR("Agent data will not be received (UDP listener failed).");
+    timeBeginPeriod(1); // 1 ms sleep granularity for the frame limiter
+    LOG_INFO("Overlay running. Insert = config, Delete = toggle, hold End = exit. %s", opt_.demo ? "(DEMO)" : "");
+
+    while (!quit_)
+    {
+        const auto frameStart = Clock::now();
+        MSG msg;
+        while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE))
+        {
+            if (msg.message == WM_QUIT) quit_ = true;
+            TranslateMessage(&msg); // generates WM_CHAR for the text fields
+            DispatchMessageW(&msg);
+        }
+        if (quit_) break;
+
+        sup_.Tick();
+
+        RECT r{};
+        const bool haveGame = GameGeometry(r);
+        const HWND fg = GetForegroundWindow();
+        const HWND mc = (opt_.demo || opt_.screenOverlay) ? nullptr : sup_.GameWindow();
+        const bool gameFocused = opt_.demo || opt_.screenOverlay || (mc && fg == mc);
+        const bool overlayFocused = fg == hwnd_;
+        HandleHotkeys(gameFocused || overlayFocused);
+
+        // User clicked away from the config window (e.g. back into the game): close it so the overlay
+        // does not keep swallowing the mouse.
+        if (configOpen_ && !overlayFocused && Clock::now() - configOpenedAt_ > 400ms && !opt_.demo && !opt_.
+            screenOverlay) CloseConfig();
+
+        const bool active = haveGame && (gameFocused || overlayFocused || configOpen_);
+        if (!active)
+        {
+            SetShown(false);
+            MsgWaitForMultipleObjects(0, nullptr, FALSE, 50, QS_ALLINPUT); // idle cheaply while the game is not visible
+            continue;
+        }
+        SetShown(true);
+        if (opt_.openConfig && !openedAtStart_)
+        {
+            openedAtStart_ = true;
+            OpenConfig();
+        }
+        RenderFrame(r, gameFocused);
+        Pace(frameStart);
+    }
+    timeEndPeriod(1);
+    LOG_INFO("Overlay stopped.");
+    return 0;
+}
+
+// ------------------------------------------------------------------------------------------------ frame
+
+void EspOverlay::RenderFrame(const RECT& r, bool /*gameFocused*/)
+{
+    const int w = r.right - r.left, h = r.bottom - r.top;
+    if (!gfx_.Resize(w, h)) return;
+    const auto now = Clock::now();
+
+    // ---- 1. newest data -> smoother (the UDP thread only ever swaps a pointer; we never block on it) ----
+    if (opt_.demo)
+    {
+        if (now - lastDemoPush_ >= 50ms)
+        {
+            lastDemoPush_ = now;
+            WorldSnapshot d = demo_.Tick();
+            d.seq = ++demoSeq_;
+            d.arrived = now;
+            smoother_.Push(d);
+        }
+    }
+    else if (auto sp = udp_.Latest(); sp && sp->seq != lastSeq_)
+    {
+        lastSeq_ = sp->seq;
+        smoother_.Push(*sp);
+    }
+    WorldSnapshot snap;
+    if (smoother_.HasData()) snap = smoother_.Predict(now, settings_.smoothing);
+    const bool stale = !opt_.demo && (udp_.LastPacketTime() == Clock::time_point{} || now - udp_.LastPacketTime() >
+        1500ms);
+
+    // ---- 2. camera reconstructed from the local player (see Camera.h) ----
+    Camera cam;
+    const bool haveCam = !stale && snap.localValid && snap.local.yawValid && snap.local.pitchValid;
+    if (haveCam)
+    {
+        cam.eye = {snap.local.pos.x, snap.local.pos.y + Camera::kEyeHeight, snap.local.pos.z};
+        cam.yawDeg = snap.local.yawDeg;
+        cam.pitchDeg = snap.local.pitchDeg;
+        cam.fovYDeg = presets::Fovs[settings_.fovIdx];
+        cam.w = w;
+        cam.h = h;
+        cam.Update();
+    }
+
+    // ---- 3. draw into the off-screen surface ----
+    // While the config window is open the whole surface is given alpha 1/255: invisible, but hit-testable,
+    // so clicks outside the panel do not leak through into the game.
+    gfx_.Begin(configOpen_ ? Col{0, 0, 0, 1.f / 255.f} : Col{0, 0, 0, 0});
+    if (visible_ && haveCam)
+    {
+        renderer_.DrawWorld(gfx_, settings_, cam, snap);
+        if (settings_.showMinimap) renderer_.DrawMinimap(gfx_, settings_, cam, snap, w);
+    }
+
+    // HUD (top-left)
+    ++fpsFrames_;
+    if (now - fpsWindowStart_ >= 500ms)
+    {
+        fps_ = fpsFrames_ / std::chrono::duration<float>(now - fpsWindowStart_).count();
+        fpsFrames_ = 0;
+        fpsWindowStart_ = now;
+    }
+    char line[200];
+    const char* state = !visible_ ? "hidden" : (opt_.demo ? "demo" : haveCam ? "active" : "waiting");
+    if (exitHolding_)
+    {
+        const float left = 3.f - std::chrono::duration<float>(now - exitHoldStart_).count();
+        std::snprintf(line, sizeof line, "external-esp  |  exiting in %.1fs (release to cancel)", std::max(0.f, left));
+        gfx_.Text(line, 10, 8, Font::Ui, Col{1.f, 0.45f, 0.35f, 1.f}, true);
+    }
+    else
+    {
+        std::snprintf(line, sizeof line, "external-esp  |  %s  |  %.0f fps", state, fps_);
+        gfx_.Text(line, 10, 8, Font::Ui, Col{0.80f, 0.85f, 1.f, 0.95f}, true);
+    }
+    std::string status = sup_.Status();
+    if (!opt_.demo && !snap.status.empty() && !stale) status += "  |  " + snap.status;
+    gfx_.Text(status, 10, 26, Font::UiSmall, Col{0.62f, 0.67f, 0.80f, 0.9f}, true);
+    if (!opt_.demo && !stale && snap.localValid && !haveCam)
+        gfx_.Text("heading unavailable: the agent could not find the look-vector method (see esp_layout.json)", 10, 42,
+                  Font::UiSmall, Col{1.f, 0.6f, 0.4f, 1.f}, true);
+    if (haveCam && visible_ && snap.players.empty() && !opt_.demo)
+        gfx_.Text("no other players in range", 10, 42, Font::UiSmall, Col{0.55f, 0.6f, 0.72f, 0.8f}, true);
+
+    if (configOpen_)
+    {
+        UiInput in = pend_;
+        pend_.pressed = pend_.released = pend_.rpressed = false; // edges are one-frame events
+        pend_.wheel = 0;
+        pend_.chars.clear();
+        pend_.keys.clear();
+        ui_.Draw(gfx_, in, w, h);
+    }
+
+    if (!gfx_.End()) return; // render target lost; Resize() rebuilds it next frame
+    gfx_.Present(hwnd_, r.left, r.top, presets::OverlayOpacity[settings_.overlayOpacityIdx]);
+    if (settings_.vsync) DwmFlush(); // VSync: wait for the compositor's next refresh-aligned pass
+}

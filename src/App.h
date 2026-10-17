@@ -1,0 +1,19 @@
+// App.h - command-line options shared by main / supervisor / overlay.
+#pragma once
+#include "Platform.h"
+#include <cstdint>
+#include <filesystem>
+#include <string>
+
+struct AppOptions
+{
+    bool demo = false; // synthetic players, no Minecraft needed (UI / projection testing)
+    DWORD pid = 0; // attach to this PID (two clients on one PC)
+    uint16_t port = 47615; // UDP port the agent sends to
+    bool autoInject = true; // load the agent automatically
+    std::string javaPath; // optional java.exe override for the attach helper
+    std::filesystem::path jarPath; // esp-agent.jar (default: next to the exe)
+    int agentHz = 60; // snapshot rate requested from the agent
+    bool screenOverlay = false; // cover the whole primary monitor instead of tracking the game window
+    bool openConfig = false; // open the config window as soon as the overlay is visible
+};

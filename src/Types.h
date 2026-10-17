@@ -1,47 +1,41 @@
-// Types.h - plain data shared between the memory-polling thread and the UI thread.
+// Types.h - data shared between the UDP thread and the UI/render thread.
 #pragma once
-#include <mutex>
+#include <chrono>
+#include <cstdint>
 #include <string>
-#include <utility>
 #include <vector>
 
-struct Vec3 {
-    double x = 0.0, y = 0.0, z = 0.0;
+struct Vec3
+{
+    double x = 0, y = 0, z = 0;
 };
 
-// One PLAYER (the local player or a remote player). The radar only ever draws players.
-// Minecraft conventions: +X = east, +Z = south, +Y = up.
-// yaw (degrees): 0 = facing +Z (south), 90 = facing -X (west), 180 = north, -90 = east.
-struct PlayerState {
+// Minecraft conventions: +X east, +Y up, +Z south. yaw 0 = facing +Z, increasing clockwise seen from
+// above (so yaw 90 faces -X / west); pitch +90 = looking straight down.
+struct PlayerState
+{
+    Vec3 pos; // feet position
+    float yawDeg = 0, pitchDeg = 0, health = 0;
+    bool yawValid = false, pitchValid = false, healthValid = false;
+    std::string name;
+};
+
+// Dropped item entity. The protocol carries them ("I" lines) but the current agent does not
+// discover item entities yet, so this list stays empty unless an agent version sends them.
+struct ItemState
+{
     Vec3 pos;
-    float yawDeg = 0.0f;
-    bool yawValid = true;      // false when the heading could not be determined
-    std::string name;          // account name when known (agent mode), else empty
+    std::string name;
+    int count = 1;
 };
 
-// Everything the renderer needs for one frame. Produced by the worker thread.
-struct WorldSnapshot {
-    bool attached = false;     // connected to a Minecraft process (or demo mode)
-    bool localValid = false;   // local player data was read successfully this tick
+struct WorldSnapshot
+{
+    bool localValid = false;
     PlayerState local;
-    std::vector<PlayerState> others;
-    std::string status = "Starting...";
-};
-
-// Mutex-protected hand-off point between the poller (writer) and the renderer (reader).
-// The snapshot is small (a few KB at most), so copying it out is cheaper and simpler
-// than any lock-free scheme and guarantees the renderer never sees a half-written frame.
-class SharedState {
-public:
-    void Publish(WorldSnapshot s) {
-        std::lock_guard<std::mutex> lk(m_);
-        snap_ = std::move(s);
-    }
-    WorldSnapshot Get() const {
-        std::lock_guard<std::mutex> lk(m_);
-        return snap_;
-    }
-private:
-    mutable std::mutex m_;
-    WorldSnapshot snap_;
+    std::vector<PlayerState> players; // OTHER players only
+    std::vector<ItemState> items;
+    std::string status; // agent status line
+    uint64_t seq = 0; // increments per received datagram
+    std::chrono::steady_clock::time_point arrived{};
 };

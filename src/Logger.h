@@ -1,42 +1,23 @@
-// Logger.h - tiny thread-safe console logger (printf style, no dependencies).
+// Logger.h - port of EspLogger.cs: esp_log.txt next to the exe (trimmed to 2000 lines at start-up),
+// mirrored to the console (this build is a console-subsystem exe: no -mwindows).
 #pragma once
 #include <cstdarg>
-#include <cstdio>
-#include <ctime>
-#include <mutex>
 
 #if defined(__GNUC__)
-#define MCR_PRINTF(fmtIdx, argIdx) __attribute__((format(printf, fmtIdx, argIdx)))
+#define ESP_PRINTF(f, a) __attribute__((format(printf, f, a)))
 #else
-#define MCR_PRINTF(fmtIdx, argIdx)
+#define ESP_PRINTF(f, a)
 #endif
 
-namespace rlog {
+namespace elog
+{
+    enum class Level { Info, Warn, Error };
 
-enum class Level { Debug, Info, Warn, Error };
+    void Init(); // trim old log, write session banner
+    ESP_PRINTF(2, 3)
+    void Write(Level lvl, const char* fmt, ...);
+} // namespace elog
 
-MCR_PRINTF(2, 3)
-inline void Write(Level lvl, const char* fmt, ...) {
-    static std::mutex mtx;  // worker thread + UI thread both log
-    std::lock_guard<std::mutex> lock(mtx);
-
-    static const char* const kTags[] = {"DEBUG", "INFO ", "WARN ", "ERROR"};
-    std::time_t now = std::time(nullptr);
-    char ts[16] = {};
-    std::strftime(ts, sizeof ts, "%H:%M:%S", std::localtime(&now));  // guarded by mtx
-
-    std::fprintf(stdout, "[%s] [%s] ", ts, kTags[static_cast<int>(lvl)]);
-    va_list ap;
-    va_start(ap, fmt);
-    std::vfprintf(stdout, fmt, ap);
-    va_end(ap);
-    std::fputc('\n', stdout);
-    std::fflush(stdout);
-}
-
-}  // namespace rlog
-
-#define LOG_DEBUG(...) ::rlog::Write(::rlog::Level::Debug, __VA_ARGS__)
-#define LOG_INFO(...)  ::rlog::Write(::rlog::Level::Info, __VA_ARGS__)
-#define LOG_WARN(...)  ::rlog::Write(::rlog::Level::Warn, __VA_ARGS__)
-#define LOG_ERROR(...) ::rlog::Write(::rlog::Level::Error, __VA_ARGS__)
+#define LOG_INFO(...)  ::elog::Write(::elog::Level::Info, __VA_ARGS__)
+#define LOG_WARN(...)  ::elog::Write(::elog::Level::Warn, __VA_ARGS__)
+#define LOG_ERROR(...) ::elog::Write(::elog::Level::Error, __VA_ARGS__)

@@ -13,7 +13,7 @@ final class Log {
         try {
             File dir = new File(exportDir);
             if (!dir.isDirectory()) dir.mkdirs();
-            file = new File(dir, "mcradar_agent.log");
+            file = new File(dir, "esp_agent.log");
         } catch (Throwable ignored) { }
     }
 

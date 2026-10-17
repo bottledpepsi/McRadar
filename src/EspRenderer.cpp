@@ -1,0 +1,328 @@
+#include "EspRenderer.h"
+#include "Avatar.h"
+#include "FriendList.h"
+#include "Presets.h"
+#include <algorithm>
+#include <cmath>
+#include <cstdio>
+
+using presets::kUnlimited;
+
+namespace
+{
+    // Same constants as the C# tool.
+    constexpr float TRACER_NEAR = 10.f, TRACER_FAR = 60.f;
+    constexpr float BOX_NEAR = 10.f, BOX_FAR = 80.f;
+    constexpr double kPlayerH = 1.8, kPlayerW = 0.6; // Minecraft player hitbox (standing)
+    constexpr double kDeg2Rad = 3.14159265358979323846 / 180.0;
+
+    const Col kEnemy{1.00f, 0.16f, 0.16f, 1.f};
+    const Col kFriend{0.16f, 1.00f, 0.35f, 1.f};
+    const Col kText{1, 1, 1, 1};
+    const Col kDistText{0.85f, 0.88f, 0.95f, 0.9f};
+
+    Font NameFont(const Settings& s)
+    {
+        return s.nameSizeIdx == 0 ? Font::Name10 : s.nameSizeIdx == 2 ? Font::Name17 : Font::Name13;
+    }
+
+    float Clamp01(float v) { return std::clamp(v, 0.f, 1.f); }
+
+    std::string DistText(const Settings& s, float dist)
+    {
+        char b[24];
+        if (s.distFmtIdx == 0) std::snprintf(b, sizeof b, "%dm", static_cast<int>(dist));
+        else std::snprintf(b, sizeof b, "%.2fk", dist / 1000.f);
+        return b;
+    }
+} // namespace
+
+// Names above, distance below, friend avatar placeholder next to the name.
+void EspRenderer::DrawLabels(Gfx& g, const Settings& s, const PlayerState& p, float dist, bool isFriend,
+                             float cx, float top, float bottom)
+{
+    const float maxLabel = presets::LabelDist[s.labelDistIdx];
+    if (dist > maxLabel) return;
+    if (s.showPlayerNames && !p.name.empty())
+    {
+        const Font f = NameFont(s);
+        const float px = presets::NameSizes[s.nameSizeIdx];
+        const float y = top - px - 7.f;
+        g.TextCentered(p.name, cx, y, f, isFriend ? kFriend : kText, s.textShadow);
+        if (isFriend)
+        {
+            // avatar placeholder (see Avatar.h)
+            const float tw = g.TextWidth(p.name, f);
+            const float a = px + 2.f, ax = cx - tw * 0.5f - a - 4.f;
+            const AvatarColor ac = AvatarColorFor(p.name);
+            g.FillRRect(ax, y + 1, a, a, 2.f, Col{ac.r, ac.g, ac.b, 0.9f});
+            g.TextCentered(AvatarInitial(p.name), ax + a * 0.5f, y + 1, Font::Hint, Col{1, 1, 1, 1});
+        }
+    }
+    if (s.distFmtIdx < 2) g.TextCentered(DistText(s, dist), cx, bottom + 3.f, Font::UiSmall, kDistText, s.textShadow);
+}
+
+void EspRenderer::DrawTracer(Gfx& g, const Settings& s, const Camera& cam, const Vec3& target, float dist,
+                             bool isFriend)
+{
+    double xc, yc, zc;
+    cam.ToCamera(target, xc, yc, zc);
+    if (zc < Camera::kNear) return; // behind the camera
+    // Off-screen aware: clamp NDC to the screen edge so the tracer still points toward the target.
+    const float ndcX = std::clamp(static_cast<float>(xc / zc * cam.k / cam.aspect), -1.f, 1.f);
+    const float ndcY = std::clamp(static_cast<float>(yc / zc * cam.k), -1.f, 1.f);
+    const float tx = (ndcX + 1.f) * 0.5f * cam.w, ty = (1.f - ndcY) * 0.5f * cam.h;
+    const float ox = cam.w * 0.5f, oy = s.tracerOriginIdx == 0 ? static_cast<float>(cam.h) : cam.h * 0.5f;
+
+    float opacity = presets::TraceOpacities[s.tracerOpacityIdx];
+    if (s.tracerFade) opacity *= 1.f - Clamp01((dist - TRACER_NEAR) / (TRACER_FAR * 2.f - TRACER_NEAR));
+    if (opacity <= 0.01f) return;
+
+    Col c;
+    if (s.tracerColorIdx == 1) c = Col{1, 1, 1, opacity};
+    else if (isFriend) c = kFriend.with(opacity);
+    else
+    {
+        const float t = Clamp01((dist - TRACER_NEAR) / (TRACER_FAR - TRACER_NEAR));
+        c = Col{1.f - t, t, 0.f, opacity};
+    } // near = red, far = green
+    g.Line(ox, oy, tx, ty, c, presets::Thickness[s.tracerThickIdx]);
+}
+
+void EspRenderer::DrawSkeleton(Gfx& g, const Settings& s, const Camera& cam, const PlayerState& p, float dist,
+                               bool isFriend)
+{
+    const double yaw = p.yawValid ? p.yawDeg * kDeg2Rad : 0.0;
+    const double rx = -std::cos(yaw), rz = -std::sin(yaw); // player's right
+    const double fx = -std::sin(yaw), fz = std::cos(yaw); // player's forward
+    auto J = [&](double side, double fwd, double y)
+    {
+        return Vec3{p.pos.x + rx * side + fx * fwd, p.pos.y + y, p.pos.z + rz * side + fz * fwd};
+    };
+    float tx, ty;
+    if (!cam.Project(J(0, 0, 0.9), tx, ty)) return; // body centre must be in front of the camera
+
+    struct P2
+    {
+        float x, y;
+    };
+    auto pr = [&](const Vec3& v)
+    {
+        P2 o;
+        cam.ProjectClamped(v, o.x, o.y);
+        return o;
+    };
+    const P2 head = pr(J(0, 0, 1.62)), headTop = pr(J(0, 0, 1.87)), neck = pr(J(0, 0, 1.45));
+    const P2 shL = pr(J(-0.30, 0, 1.40)), shR = pr(J(0.30, 0, 1.40));
+    const P2 hipC = pr(J(0, 0, 0.72)), hipL = pr(J(-0.12, 0, 0.72)), hipR = pr(J(0.12, 0, 0.72));
+    const P2 handL = pr(J(-0.37, 0.06, 0.72)), handR = pr(J(0.37, 0.06, 0.72));
+    const P2 footL = pr(J(-0.12, 0, 0)), footR = pr(J(0.12, 0, 0));
+
+    Col c = isFriend ? kFriend.with(0.95f) : kEnemy.with(0.95f);
+    if (!isFriend && s.playerColorIdx == 1)
+    {
+        const float t = Clamp01((dist - BOX_NEAR) / (BOX_FAR - BOX_NEAR));
+        c = Col{1.f - t, t, 0.f, 0.95f};
+    }
+    const float sw = std::max(1.5f, presets::Thickness[s.boxThickIdx]);
+    const float headR = std::max(3.f, std::hypot(head.x - headTop.x, head.y - headTop.y));
+    g.Circle(head.x, head.y, headR, c, sw);
+    g.Line(neck.x, neck.y, hipC.x, hipC.y, c, sw);
+    g.Line(shL.x, shL.y, shR.x, shR.y, c, sw);
+    g.Line(shL.x, shL.y, handL.x, handL.y, c, sw);
+    g.Line(shR.x, shR.y, handR.x, handR.y, c, sw);
+    g.Line(hipL.x, hipL.y, hipR.x, hipR.y, c, sw);
+    g.Line(hipL.x, hipL.y, footL.x, footL.y, c, sw);
+    g.Line(hipR.x, hipR.y, footR.x, footR.y, c, sw);
+
+    DrawLabels(g, s, p, dist, isFriend, head.x, head.y - headR, std::max(footL.y, footR.y));
+}
+
+void EspRenderer::DrawPlayer(Gfx& g, const Settings& s, const Camera& cam, const PlayerState& p, float dist,
+                             bool isFriend)
+{
+    if (s.boxStyleIdx == static_cast<int>(BoxStyle::Skeleton))
+    {
+        DrawSkeleton(g, s, cam, p, dist, isFriend);
+        return;
+    }
+
+    float cx, cy;
+    if (!cam.Project({p.pos.x, p.pos.y + kPlayerH * 0.5, p.pos.z}, cx, cy)) return; // centre behind camera -> skip
+
+    // Project the 8 AABB corners; corners that straddle the camera plane are clamped to the near plane.
+    const double hw = kPlayerW * 0.5;
+    float minX = 1e9f, minY = 1e9f, maxX = -1e9f, maxY = -1e9f;
+    for (int xi = 0; xi < 2; ++xi)
+        for (int yi = 0; yi < 2; ++yi)
+            for (int zi = 0; zi < 2; ++zi)
+            {
+                float sx, sy;
+                cam.ProjectClamped({
+                                       p.pos.x + (xi ? hw : -hw), p.pos.y + (yi ? kPlayerH : 0.0),
+                                       p.pos.z + (zi ? hw : -hw)
+                                   }, sx, sy);
+                minX = std::min(minX, sx);
+                maxX = std::max(maxX, sx);
+                minY = std::min(minY, sy);
+                maxY = std::max(maxY, sy);
+            }
+    const float bx = minX, by = minY, bw = maxX - minX, bh = maxY - minY;
+    if (bw < 2.f || bh < 2.f) return;
+    if (maxX < 0 || minX > cam.w || maxY < 0 || minY > cam.h) return; // entirely off-screen
+
+    const Col base = isFriend ? kFriend : kEnemy;
+    const float fill = presets::Opacities[s.boxFillIdx];
+    if (fill > 0.f) g.FillRect(bx, by, bw, bh, base.with(fill));
+
+    Col outline = base.with(0.90f);
+    if (!isFriend && s.playerColorIdx == 1)
+    {
+        // Gradient: red (close) -> green (far)
+        const float t = Clamp01((dist - BOX_NEAR) / (BOX_FAR - BOX_NEAR));
+        outline = Col{1.f - t, t, 0.f, 0.90f};
+    }
+    const float thick = presets::Thickness[s.boxThickIdx], cr = presets::CornerRadius[s.cornerRadiusIdx];
+    switch (static_cast<BoxStyle>(s.boxStyleIdx))
+    {
+    case BoxStyle::CornerOnly:
+        {
+            const float t = std::min(bw * 0.3f, 10.f);
+            g.Line(bx, by, bx + t, by, outline, thick);
+            g.Line(bx, by, bx, by + t, outline, thick);
+            g.Line(bx + bw, by, bx + bw - t, by, outline, thick);
+            g.Line(bx + bw, by, bx + bw, by + t, outline, thick);
+            g.Line(bx, by + bh, bx + t, by + bh, outline, thick);
+            g.Line(bx, by + bh, bx, by + bh - t, outline, thick);
+            g.Line(bx + bw, by + bh, bx + bw - t, by + bh, outline, thick);
+            g.Line(bx + bw, by + bh, bx + bw, by + bh - t, outline, thick);
+            break;
+        }
+    case BoxStyle::Rounded: g.RRect(bx, by, bw, bh, cr, outline, thick);
+        break;
+    default: g.Rect(bx, by, bw, bh, outline, thick);
+        break;
+    }
+
+    if (s.showHealth && p.healthValid)
+    {
+        // vertical bar on the box's left edge
+        const float ratio = Clamp01(p.health / 20.f);
+        const float barX = bx - 5.f - thick * 0.5f;
+        g.FillRect(barX, by, 3.f, bh, Col{0, 0, 0, 0.55f});
+        const float fh = bh * ratio;
+        g.FillRect(barX, by + bh - fh, 3.f, fh, Col{1.f - ratio, ratio, 0.10f, 1.f});
+    }
+    DrawLabels(g, s, p, dist, isFriend, bx + bw * 0.5f, by, by + bh);
+}
+
+void EspRenderer::DrawItem(Gfx& g, const Settings& s, const Camera& cam, const ItemState& it, float dist)
+{
+    float cx, cy;
+    if (!cam.Project({it.pos.x, it.pos.y + 0.15, it.pos.z}, cx, cy)) return;
+    float minX = 1e9f, minY = 1e9f, maxX = -1e9f, maxY = -1e9f;
+    for (int xi = 0; xi < 2; ++xi)
+        for (int yi = 0; yi < 2; ++yi)
+            for (int zi = 0; zi < 2; ++zi)
+            {
+                float sx, sy;
+                cam.ProjectClamped({
+                                       it.pos.x + (xi ? 0.2 : -0.2), it.pos.y + (yi ? 0.3 : 0.0),
+                                       it.pos.z + (zi ? 0.2 : -0.2)
+                                   }, sx, sy);
+                minX = std::min(minX, sx);
+                maxX = std::max(maxX, sx);
+                minY = std::min(minY, sy);
+                maxY = std::max(maxY, sy);
+            }
+    if (maxX - minX < 2.f || maxY - minY < 2.f) return;
+    const float op = presets::TraceOpacities[s.itemOpacityIdx];
+    g.Rect(minX, minY, maxX - minX, maxY - minY, Col{1, 1, 1, op}, 1.f);
+    if (s.showItemNames && dist <= presets::LabelDist[s.labelDistIdx])
+    {
+        std::string label = it.name;
+        if (s.showItemCount && it.count > 1) label += " x" + std::to_string(it.count);
+        g.TextCentered(label, (minX + maxX) * 0.5f, minY - 17.f, Font::Name13, Col{1, 1, 1, op}, s.textShadow);
+    }
+}
+
+void EspRenderer::DrawWorld(Gfx& g, const Settings& s, const Camera& cam, const WorldSnapshot& snap)
+{
+    const float maxDist = presets::PlayerDist[s.maxPlayerDistIdx];
+    struct E
+    {
+        const PlayerState* p;
+        float dist;
+        bool fr;
+    };
+    std::vector<E> list;
+    for (const auto& p : snap.players)
+    {
+        const float d = static_cast<float>(cam.Distance(p.pos));
+        if (d > maxDist) continue;
+        list.push_back({&p, d, FriendList::Contains(p.name)});
+    }
+    std::sort(list.begin(), list.end(), [](const E& a, const E& b) { return a.dist > b.dist; });
+    // far first -> near on top
+
+    if (s.showTracers)
+        for (const auto& e : list)
+        {
+            const double ty = s.tracerTargetIdx == 0
+                                  ? e.p->pos.y
+                                  : s.tracerTargetIdx == 2
+                                  ? e.p->pos.y + kPlayerH
+                                  : e.p->pos.y + kPlayerH * 0.5;
+            DrawTracer(g, s, cam, {e.p->pos.x, ty, e.p->pos.z}, e.dist, e.fr);
+        }
+    if (s.showPlayers)
+        for (const auto& e : list) DrawPlayer(g, s, cam, *e.p, e.dist, e.fr);
+
+    if (s.showItems)
+        for (const auto& it : snap.items)
+        {
+            if (s.hideJunk && presets::IsJunkItem(it.name)) continue;
+            DrawItem(g, s, cam, it, static_cast<float>(cam.Distance(it.pos)));
+        }
+}
+
+// Top-right radar, north-up like the original (+X east = right, +Z south = down).
+void EspRenderer::DrawMinimap(Gfx& g, const Settings& s, const Camera& cam, const WorldSnapshot& snap, int winW)
+{
+    const int mm = presets::MinimapSizes[s.minimapSizeIdx];
+    const float range = static_cast<float>(presets::MinimapRanges[s.minimapRangeIdx]);
+    const float x = winW - mm - 12.f, y = 12.f, r = mm * 0.5f, cx = x + r, cy = y + r;
+    const Col bg{0.05f, 0.06f, 0.09f, 0.72f}, line{0.40f, 0.45f, 0.60f, 0.45f}, border{0.30f, 0.34f, 0.48f, 0.9f};
+
+    g.FillRRect(x, y, static_cast<float>(mm), static_cast<float>(mm), 6.f, bg);
+    g.RRect(x, y, static_cast<float>(mm), static_cast<float>(mm), 6.f, border, 1.5f);
+    g.Circle(cx, cy, r * 0.5f, line, 0.5f);
+    g.Circle(cx, cy, r - 2.f, line, 0.5f);
+    g.Line(cx, y + 2, cx, y + mm - 2, line, 0.5f);
+    g.Line(x + 2, cy, x + mm - 2, cy, line, 0.5f);
+
+    const float scale = (r - 4.f) / range;
+    const float maxDist = presets::PlayerDist[s.maxPlayerDistIdx];
+    for (const auto& p : snap.players)
+    {
+        if (cam.Distance(p.pos) > maxDist) continue;
+        float dx = static_cast<float>(p.pos.x - cam.eye.x) * scale, dz = static_cast<float>(p.pos.z - cam.eye.z) *
+                  scale;
+        const float d = std::hypot(dx, dz);
+        if (d > r - 4.f)
+        {
+            const float k = (r - 4.f) / d;
+            dx *= k;
+            dz *= k;
+        } // clamp to the rim
+        g.FillCircle(cx + dx, cy + dz, 3.f, FriendList::Contains(p.name) ? kFriend : kEnemy);
+    }
+    // Self: dot + facing wedge. World forward = (-sin yaw, +cos yaw) in (x, z), which maps 1:1 to screen (x, y).
+    const double yaw = cam.yawDeg * kDeg2Rad;
+    const float fx = static_cast<float>(-std::sin(yaw)), fz = static_cast<float>(std::cos(yaw));
+    g.FillTriangle(cx + fx * 9.f, cy + fz * 9.f, cx - fz * 4.f - fx * 2.f, cy + fx * 4.f - fz * 2.f,
+                   cx + fz * 4.f - fx * 2.f, cy - fx * 4.f - fz * 2.f, Col{0.35f, 0.60f, 1.f, 0.95f});
+    g.FillCircle(cx, cy, 2.5f, Col{0.35f, 0.60f, 1.f, 1.f});
+    g.Text(std::to_string(static_cast<int>(range)) + "m", x + 4, y + mm - 15.f, Font::Hint,
+           Col{0.7f, 0.75f, 0.9f, 0.8f});
+}

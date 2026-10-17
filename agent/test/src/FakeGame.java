@@ -21,12 +21,14 @@ class E {                             // Entity (new style)
     }
     public V m2() { return q; }       // position()  - NOT unit length
     public V m3() { return r; }       // deltaMovement
+    public float getHealth() { return 17.5f; }
 }
 class OE {                            // Entity (old style): plain doubles, triples in declaration order
     double px, py, pz;                // position
     double mx, my, mz;                // motion
     double lx, ly, lz;                // last-tick position
     float yaw, pitch;
+    public float getHealth() { return 12f; }
     public V look() {
         double y = Math.toRadians(yaw), p = Math.toRadians(pitch);
         return new V(-Math.sin(y) * Math.cos(p), -Math.sin(p), Math.cos(y) * Math.cos(p));
@@ -55,6 +57,10 @@ public class FakeGame {
 
     public static void main(String[] args) throws Exception {
         final boolean old = Arrays.asList(args).contains("old");
+        final boolean fixed = Arrays.asList(args).contains("static");     // frozen world (for pixel-exact overlay tests)
+        float fy = 0, fp = 0;
+        for (String a : args) { if (a.startsWith("yaw=")) fy = Float.parseFloat(a.substring(4)); if (a.startsWith("pitch=")) fp = Float.parseFloat(a.substring(6)); }
+        final float fixedYaw = fy, fixedPitch = fp;
         final M m = new M(); M.instance = m; m.level = new Lvl(); m.server = new Srv();
         final String[] names = {"Alice", "Bob", "Carol"};
         final Object[] pl = new Object[3];
@@ -71,11 +77,12 @@ public class FakeGame {
         long t0 = System.currentTimeMillis();
         while (System.currentTimeMillis() - t0 < 120000) {
             double t = (System.currentTimeMillis() - t0) / 1000.0;
-            float yaw = (float) ((t * 30) % 360 - 180);
-            double[][] pos = { {100 + 5 * Math.sin(t), 64, -50 + 5 * Math.cos(t)}, {110, 64, -40 + 3 * Math.sin(t)}, {90, 70, -60} };
+            float yaw = fixed ? fixedYaw : (float) ((t * 30) % 360 - 180);
+            double[][] pos = fixed ? new double[][] { {100, 64, -50}, {110, 64, -40}, {90, 70, -60} }
+                                   : new double[][] { {100 + 5 * Math.sin(t), 64, -50 + 5 * Math.cos(t)}, {110, 64, -40 + 3 * Math.sin(t)}, {90, 70, -60} };
             for (int i = 0; i < 3; i++) {
-                if (old) { OP o = (OP) pl[i]; o.px = pos[i][0]; o.py = pos[i][1]; o.pz = pos[i][2]; o.lx = o.px - .1; o.ly = o.py; o.lz = o.pz; o.mx = .05; o.yaw = i == 0 ? yaw : 45f * i; }
-                else { P x = (P) pl[i]; x.q = new V(pos[i][0], pos[i][1], pos[i][2]); x.r = new V(.01, 0, .02); x.f1 = i == 0 ? yaw : 45f * i; }
+                if (old) { OP o = (OP) pl[i]; o.px = pos[i][0]; o.py = pos[i][1]; o.pz = pos[i][2]; o.lx = o.px - .1; o.ly = o.py; o.lz = o.pz; o.mx = .05; o.yaw = i == 0 ? yaw : 45f * i; o.pitch = i == 0 ? 20f : 10f * i; }
+                else { P x = (P) pl[i]; x.q = new V(pos[i][0], pos[i][1], pos[i][2]); x.r = new V(.01, 0, .02); x.f1 = i == 0 ? yaw : 45f * i; x.f2 = i == 0 ? (fixed ? fixedPitch : 20f) : 10f * i; }
             }
             if (((int) t) % 5 == 0 && t - Math.floor(t) < 0.05) System.out.printf("expected Alice yaw=%.1f x=%.3f z=%.3f%n", yaw, pos[0][0], pos[0][2]);
             Thread.sleep(50);

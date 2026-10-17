@@ -1,40 +1,51 @@
 cmake_minimum_required(VERSION 3.16)
-project(McRadar LANGUAGES CXX)
+project(McEsp LANGUAGES CXX)
 
 if(NOT WIN32)
-  message(FATAL_ERROR "McRadar is a Windows-only project (Win32 API).")
+  message(FATAL_ERROR "mcesp is a Windows-only project (Win32 + Direct2D).")
 endif()
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-add_executable(mcradar
-  src/main.cpp src/Config.cpp src/ProcessManager.cpp src/MemoryScanner.cpp
-  src/GameReader.cpp src/Poller.cpp src/RadarWindow.cpp
-  src/AgentReceiver.cpp src/AgentLauncher.cpp)
+add_executable(mcesp
+        src/main.cpp src/Logger.cpp src/Json.cpp src/Presets.cpp src/EspConfig.cpp
+        src/FriendList.cpp src/ProfileManager.cpp src/Wire.cpp
+        src/ProcessManager.cpp src/AgentInjector.cpp src/AgentSupervisor.cpp src/UdpListener.cpp
+        src/Gfx.cpp src/EspRenderer.cpp src/ConfigUi.cpp src/EspOverlay.cpp)
 
-# Console subsystem on purpose: log output appears in the terminal. Do NOT add -mwindows.
-target_link_libraries(mcradar PRIVATE gdi32 user32 kernel32 ws2_32)
+# Console subsystem on purpose (logs are visible in the terminal): do NOT add -mwindows.
+target_link_libraries(mcesp PRIVATE d2d1 dwrite dwmapi winmm gdi32 user32 ws2_32)
 
+# Default OFF: a fully static link (-static) fails on newer MinGW-w64 toolchains such as CLion 2026's bundled
+# GCC 15 (undefined __intrinsic_setjmpex / __ms_vsnprintf from libpthread.a / libmsvcrt.a). The default links
+# libgcc/libstdc++ statically and uses libwinpthread-1.dll, which is copied next to the exe below.
+option(ESP_STATIC "Fully static link (single exe). Works on some toolchains only." OFF)
 if(MINGW)
-  target_compile_options(mcradar PRIVATE -Wall -Wextra -O2)
-  option(MCRADAR_STATIC_RUNTIME "Link libgcc/libstdc++ statically" ON)
-  if(MCRADAR_STATIC_RUNTIME)
-    target_link_options(mcradar PRIVATE -static-libgcc -static-libstdc++)
+  target_compile_options(mcesp PRIVATE -Wall -Wextra -O2)
+  if(ESP_STATIC)
+    target_link_options(mcesp PRIVATE -static)
+  else()
+    target_link_options(mcesp PRIVATE -static-libgcc -static-libstdc++)
+    # dynamic winpthread: ship libwinpthread-1.dll next to the exe
+    get_filename_component(_cxx_dir "${CMAKE_CXX_COMPILER}" DIRECTORY)
+    if(EXISTS "${_cxx_dir}/libwinpthread-1.dll")
+      add_custom_command(TARGET mcesp POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_if_different
+              "${_cxx_dir}/libwinpthread-1.dll" $<TARGET_FILE_DIR:mcesp>/libwinpthread-1.dll)
+    endif()
   endif()
-elseif(MSVC)
-  target_compile_options(mcradar PRIVATE /W4 /permissive- /EHsc)
+else()
+  message(WARNING "Only MinGW-w64 GCC has been tested.")
 endif()
 
-# Ship the config next to the exe.
-add_custom_command(TARGET mcradar POST_BUILD
-  COMMAND ${CMAKE_COMMAND} -E copy_if_different
-          ${CMAKE_SOURCE_DIR}/radar.ini $<TARGET_FILE_DIR:mcradar>/radar.ini)
-
-# Ship the Java agent next to the exe (build it first with agent/build.bat or agent/build.sh).
-if(EXISTS ${CMAKE_SOURCE_DIR}/agent/mcradar-agent.jar)
-  add_custom_command(TARGET mcradar POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            ${CMAKE_SOURCE_DIR}/agent/mcradar-agent.jar $<TARGET_FILE_DIR:mcradar>/mcradar-agent.jar)
+# The Java agent (build it first: agent/build.bat) must sit next to the exe.
+if(EXISTS ${CMAKE_SOURCE_DIR}/agent/esp-agent.jar)
+  add_custom_command(TARGET mcesp POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_if_different
+          ${CMAKE_SOURCE_DIR}/agent/esp-agent.jar $<TARGET_FILE_DIR:mcesp>/esp-agent.jar)
+else()
+  message(WARNING "agent/esp-agent.jar not found - run agent/build.bat (needs a JDK) before building.")
 endif()
+
+# Host-side unit tests for the platform-independent core (config/JSON/friends/profiles/wire/camera/smoother).
+# Not part of the Windows build; run on any machine:  see tests/unit_tests.cpp

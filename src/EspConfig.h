@@ -1,0 +1,96 @@
+// EspConfig.h - port of EspConfig.cs (serialized model) + the runtime "Settings" that the UI edits.
+//
+// EspConfig  : human-readable values (strings, real numbers) - exactly the JSON keys of the C# tool,
+//              so an existing esp_config.json / profile loads unchanged. A few keys were ADDED
+//              (Fov, VSync, Smoothing, ShowHealth); the C# tool ignores unknown keys.
+// Settings   : the same values as preset INDICES (cycle rows in the UI step through the presets),
+//              with Apply(EspConfig) / Build() converting between the two, like ApplyConfig/BuildConfig.
+#pragma once
+#include "Json.h"
+#include <filesystem>
+#include <string>
+
+struct EspConfig
+{
+    // Hotkeys
+    std::string HotkeyToggle = "Delete", HotkeyConfig = "Insert", HotkeyExit = "End";
+    // GENERAL
+    std::string DistanceFormat = "Meters"; // Meters | Kilometers | Off
+    int MaxLabelDist = -1; // -1 = Unlimited
+    bool TextShadow = true;
+    // PLAYERS
+    bool ShowPlayers = true, ShowPlayerNames = true;
+    std::string BoxStyle = "Sharp"; // Rounded | Sharp | Corner-only | Skeleton
+    float CornerRadius = 2.f;
+    int BoxThickness = 1;
+    std::string BoxColorMode = "Static"; // Static | Gradient
+    int NameSize = 13;
+    float BoxFillOpacity = 0.f;
+    // TRACERS
+    bool ShowTracers = true;
+    std::string TracerOrigin = "Bottom"; // Bottom | Center
+    std::string TracerColor = "Dynamic"; // Dynamic | White
+    float TracerOpacity = 0.75f;
+    int TracerThickness = 1;
+    std::string TracerTarget = "Center"; // Feet | Center | Head
+    bool TracerFade = true;
+    // ITEMS
+    bool ShowItems = true, ShowItemNames = true, ShowItemCount = true;
+    float ItemOpacity = 0.75f;
+    bool HideJunk = false;
+    // FILTERING
+    int MaxPlayerDist = -1; // -1 = Unlimited
+    // MINIMAP
+    bool ShowMinimap = true;
+    int MinimapSize = 160, MinimapRange = 100;
+    // OVERLAY
+    float OverlayOpacity = 1.0f;
+    int FpsCap = 0; // 0 = Unlimited
+    // CONFIG WINDOW position
+    float ConfigX = 16.f, ConfigY = 38.f;
+    // ---- additions in the C++ port ----
+    int Fov = 70; // vertical FOV in degrees (must match Minecraft's FOV option)
+    bool VSync = true; // pace presentation to the display refresh (DwmFlush)
+    bool Smoothing = true; // extrapolate between 20-60 Hz agent updates
+    bool ShowHealth = true; // health bar next to the box (when the agent reports health)
+
+    std::string ToJson() const;
+    static EspConfig FromJson(const json::Object& o); // missing keys keep their defaults
+};
+
+struct Settings
+{
+    int vkToggle = 0x2E, vkConfig = 0x2D, vkExit = 0x23;
+    // GENERAL
+    int distFmtIdx = 0, labelDistIdx = 3;
+    bool textShadow = true;
+    // PLAYERS
+    bool showPlayers = true, showPlayerNames = true;
+    int boxStyleIdx = 1, cornerRadiusIdx = 0, boxThickIdx = 0, playerColorIdx = 0, nameSizeIdx = 1, boxFillIdx = 0;
+    // TRACERS
+    bool showTracers = true;
+    int tracerOriginIdx = 0, tracerColorIdx = 0, tracerOpacityIdx = 2, tracerThickIdx = 0, tracerTargetIdx = 1;
+    bool tracerFade = true;
+    // ITEMS
+    bool showItems = true, showItemNames = true, showItemCount = true, hideJunk = false;
+    int itemOpacityIdx = 2;
+    // FILTERING
+    int maxPlayerDistIdx = 3;
+    // MINIMAP
+    bool showMinimap = true;
+    int minimapSizeIdx = 1, minimapRangeIdx = 1;
+    // OVERLAY
+    int overlayOpacityIdx = 0, fpsCap = 2;
+    float cfgX = 16.f, cfgY = 38.f;
+    // additions
+    int fovIdx = 1;
+    bool vsync = true, smoothing = true, showHealth = true;
+
+    void Apply(const EspConfig& c);
+    EspConfig Build() const;
+
+    // esp_config.json next to the exe. Save() is atomic (temp file + rename) and never throws.
+    void Load();
+    void Save() const;
+    static std::filesystem::path ConfigPath();
+};

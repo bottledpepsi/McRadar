@@ -1,30 +1,41 @@
-// RaiiHandle.h - RAII wrappers for Win32 / GDI resources.
-// Every handle we open is owned by one of these, so early returns, exceptions and
-// shutdown paths can never leak a HANDLE, HDC or GDI object.
+// RaiiHandle.h - RAII owners for Win32 / GDI / COM resources.
 #pragma once
 #include "Platform.h"
 #include <utility>
 
-// Owns a kernel HANDLE (process handles, toolhelp snapshots, ...).
-class UniqueHandle {
+// Kernel HANDLE (process handles, pipes, snapshots). NULL and INVALID_HANDLE_VALUE both mean "empty".
+class UniqueHandle
+{
 public:
     UniqueHandle() = default;
-    explicit UniqueHandle(HANDLE h) noexcept : h_(h) {}
-    ~UniqueHandle() { reset(); }
 
+    explicit UniqueHandle(HANDLE h) noexcept : h_(h)
+    {
+    }
+
+    ~UniqueHandle() { reset(); }
     UniqueHandle(const UniqueHandle&) = delete;
     UniqueHandle& operator=(const UniqueHandle&) = delete;
-    UniqueHandle(UniqueHandle&& o) noexcept : h_(std::exchange(o.h_, nullptr)) {}
-    UniqueHandle& operator=(UniqueHandle&& o) noexcept {
-        if (this != &o) { reset(); h_ = std::exchange(o.h_, nullptr); }
+
+    UniqueHandle(UniqueHandle&& o) noexcept : h_(std::exchange(o.h_, nullptr))
+    {
+    }
+
+    UniqueHandle& operator=(UniqueHandle&& o) noexcept
+    {
+        if (this != &o)
+        {
+            reset();
+            h_ = std::exchange(o.h_, nullptr);
+        }
         return *this;
     }
 
-    // Note: CreateToolhelp32Snapshot returns INVALID_HANDLE_VALUE on failure, OpenProcess
-    // returns NULL. valid() treats both as "no handle".
     bool valid() const noexcept { return h_ != nullptr && h_ != INVALID_HANDLE_VALUE; }
     HANDLE get() const noexcept { return h_; }
-    void reset(HANDLE next = nullptr) noexcept {
+
+    void reset(HANDLE next = nullptr) noexcept
+    {
         if (valid()) CloseHandle(h_);
         h_ = next;
     }
@@ -33,41 +44,65 @@ private:
     HANDLE h_ = nullptr;
 };
 
-// Owns a GDI object (HPEN, HBRUSH, HFONT, HBITMAP). Deleted with DeleteObject.
+// Minimal COM smart pointer (no ATL/WRL dependency under MinGW).
 template <class T>
-class GdiObject {
+class ComPtr
+{
 public:
-    GdiObject() = default;
-    explicit GdiObject(T h) noexcept : h_(h) {}
-    ~GdiObject() { if (h_) DeleteObject(h_); }
-    GdiObject(const GdiObject&) = delete;
-    GdiObject& operator=(const GdiObject&) = delete;
-    T get() const noexcept { return h_; }
-    explicit operator bool() const noexcept { return h_ != nullptr; }
+    ComPtr() = default;
+    ~ComPtr() { reset(); }
+    ComPtr(const ComPtr&) = delete;
+    ComPtr& operator=(const ComPtr&) = delete;
+
+    ComPtr(ComPtr&& o) noexcept : p_(std::exchange(o.p_, nullptr))
+    {
+    }
+
+    ComPtr& operator=(ComPtr&& o) noexcept
+    {
+        if (this != &o)
+        {
+            reset();
+            p_ = std::exchange(o.p_, nullptr);
+        }
+        return *this;
+    }
+
+    T* get() const noexcept { return p_; }
+    T* operator->() const noexcept { return p_; }
+    explicit operator bool() const noexcept { return p_ != nullptr; }
+
+    T** put() noexcept
+    {
+        reset();
+        return &p_;
+    } // for "out" parameters
+    void reset() noexcept
+    {
+        if (p_)
+        {
+            p_->Release();
+            p_ = nullptr;
+        }
+    }
+
 private:
-    T h_ = nullptr;
+    T* p_ = nullptr;
 };
 
-// Owns a memory device context created with CreateCompatibleDC.
-class MemDC {
+// Window-DC / memory-DC / DIB owners used by the overlay surface.
+class ScreenDC
+{
 public:
-    explicit MemDC(HDC like) noexcept : dc_(CreateCompatibleDC(like)) {}
-    ~MemDC() { if (dc_) DeleteDC(dc_); }
-    MemDC(const MemDC&) = delete;
-    MemDC& operator=(const MemDC&) = delete;
+    ScreenDC() : dc_(GetDC(nullptr))
+    {
+    }
+
+    ~ScreenDC() { if (dc_) ReleaseDC(nullptr, dc_); }
+    ScreenDC(const ScreenDC&) = delete;
+    ScreenDC& operator=(const ScreenDC&) = delete;
     HDC get() const noexcept { return dc_; }
-private:
-    HDC dc_;
-};
 
-// Selects a GDI object into a DC and restores the previous one on scope exit.
-class SelectGuard {
-public:
-    SelectGuard(HDC dc, HGDIOBJ obj) noexcept : dc_(dc), old_(SelectObject(dc, obj)) {}
-    ~SelectGuard() { if (old_) SelectObject(dc_, old_); }
-    SelectGuard(const SelectGuard&) = delete;
-    SelectGuard& operator=(const SelectGuard&) = delete;
 private:
     HDC dc_;
-    HGDIOBJ old_;
 };

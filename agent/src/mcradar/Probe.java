@@ -375,6 +375,7 @@ final class Probe {
         PosCand pos;
         Method look;
         Acc[] lookXyz;
+        Method healthMethod;
 
         boolean position(Object p, double[] o) {
             if (pos.vec) {
@@ -387,15 +388,28 @@ final class Probe {
             return sane(o);
         }
 
-        float yaw(Object p) {
-            if (look == null) return Float.NaN;
+        /** out[0] = yaw, out[1] = pitch (degrees); NaN when unknown. */
+        void orient(Object p, float[] out) {
+            out[0] = Float.NaN; out[1] = Float.NaN;
+            if (look == null) return;
             try {
                 Object v = look.invoke(p);
-                if (v == null) return Float.NaN;
-                double x = lookXyz[0].getDouble(v), z = lookXyz[2].getDouble(v);
-                if (Double.isNaN(x) || Double.isNaN(z) || Math.hypot(x, z) < 1e-6) return Float.NaN;
-                // Minecraft look vector: x = -sin(yaw)*cos(pitch), z = cos(yaw)*cos(pitch)
-                return (float) Math.toDegrees(Math.atan2(-x, z));
+                if (v == null) return;
+                double x = lookXyz[0].getDouble(v), y = lookXyz[1].getDouble(v), z = lookXyz[2].getDouble(v);
+                if (Double.isNaN(x) || Double.isNaN(y) || Double.isNaN(z)) return;
+                // Minecraft look vector: x = -sin(yaw)*cos(pitch), y = -sin(pitch), z = cos(yaw)*cos(pitch)
+                if (Math.hypot(x, z) > 1e-6) out[0] = (float) Math.toDegrees(Math.atan2(-x, z));
+                double n = Math.sqrt(x * x + y * y + z * z);
+                if (n > 0.5) out[1] = (float) Math.toDegrees(-Math.asin(Math.max(-1.0, Math.min(1.0, y / n))));
+            } catch (Throwable t) { /* leave NaN */ }
+        }
+
+        float health(Object p) {
+            if (healthMethod == null) return Float.NaN;
+            try {
+                Object v = healthMethod.invoke(p);
+                float f = v instanceof Number ? ((Number) v).floatValue() : Float.NaN;
+                return (f >= 0 && f <= 2048) ? f : Float.NaN;
             } catch (Throwable t) { return Float.NaN; }
         }
 
@@ -464,14 +478,47 @@ final class Probe {
             } catch (Throwable ignored) { }
         }
         if (!good.isEmpty()) {
+            // Prefer a look vector with a vertical component (the true 3-D view direction) over a
+            // horizontal-only "forward" vector, so pitch is available. Then: base class first, then name.
+            final Map<Method, Double> ySum = new HashMap<Method, Double>();
+            for (Method me : good) {
+                double sum = 0;
+                Acc[] va = vecAccessors(me.getReturnType());
+                for (Object s : samples) {
+                    try { sum += Math.abs(va[1].getDouble(me.invoke(s))); } catch (Throwable ignored) { }
+                }
+                ySum.put(me, sum);
+            }
             Collections.sort(good, new Comparator<Method>() {
                 public int compare(Method a, Method b) {
+                    int va = ySum.get(a) > 1e-3 ? 0 : 1, vb = ySum.get(b) > 1e-3 ? 0 : 1;
+                    if (va != vb) return va - vb;
                     int d = depthOf(a.getDeclaringClass()) - depthOf(b.getDeclaringClass());
                     return d != 0 ? d : a.getName().compareTo(b.getName());
                 }
             });
             m.look = good.get(0);
             m.lookXyz = vecAccessors(m.look.getReturnType());
+        }
+
+        // --- health: only a method literally named getHealth()/health() (works with Mojang, Yarn, MCP
+        //     and Forge-mapped names; obfuscated/intermediary builds report health as unknown "-").
+        for (Method me : c.getMethods()) {
+            try {
+                if (me.getParameterTypes().length != 0 || Modifier.isStatic(me.getModifiers())) continue;
+                Class<?> rt = me.getReturnType();
+                if (rt != float.class && rt != double.class) continue;
+                String n = me.getName().toLowerCase(Locale.ROOT);
+                if (!n.equals("gethealth") && !n.equals("health")) continue;
+                try { me.setAccessible(true); } catch (Throwable ignored) { }
+                boolean ok = true;
+                for (Object s : samples) {
+                    Object v = me.invoke(s);
+                    float f = v instanceof Number ? ((Number) v).floatValue() : Float.NaN;
+                    if (!(f >= 0 && f <= 2048)) { ok = false; break; }
+                }
+                if (ok) { try { me.setAccessible(true); } catch (Throwable ignored) { } m.healthMethod = me; break; }
+            } catch (Throwable ignored) { }
         }
         return m;
     }
@@ -526,10 +573,13 @@ final class Probe {
         if (built) exportLayout();
 
         double[] p3 = new double[3];
+        float[] o2 = new float[2];
         if (localObj != null) {
             Model m = models.get(localObj.getClass());
-            if (m != null && m.position(localObj, p3))
-                s.local = new Snapshot.Rec(localName, p3[0], p3[1], p3[2], m.yaw(localObj));
+            if (m != null && m.position(localObj, p3)) {
+                m.orient(localObj, o2);
+                s.local = new Snapshot.Rec(localName, p3[0], p3[1], p3[2], o2[0], o2[1], m.health(localObj));
+            }
         }
         for (Object p : players) {
             if (p == localObj) continue;
@@ -537,7 +587,8 @@ final class Probe {
             if (localName != null && localName.equals(nm)) continue;
             Model m = models.get(p.getClass());
             if (m == null || !m.position(p, p3)) continue;
-            s.players.add(new Snapshot.Rec(nm, p3[0], p3[1], p3[2], m.yaw(p)));
+            m.orient(p, o2);
+            s.players.add(new Snapshot.Rec(nm, p3[0], p3[1], p3[2], o2[0], o2[1], m.health(p)));
         }
         s.status = s.local == null ? "connected, but local player not found (set user=NAME?)"
                                    : "agent ok: " + s.players.size() + " other player(s)";
@@ -577,7 +628,7 @@ final class Probe {
     }
 
     /**
-     * Writes everything that was discovered to mcradar_layout.json: the field paths and the
+     * Writes everything that was discovered to esp_layout.json: the field paths and the
      * in-object byte offsets (as reported by Unsafe) - i.e. the "offsets" for THIS exact game
      * version / mapping / JVM. Offsets inside an object can be reused with ReadProcessMemory.
      * (Deliberately does NOT include the launch command line - it contains your access token.)
@@ -609,12 +660,14 @@ final class Probe {
                 }
                 b.append(", \"lookMethod\": ").append(m.look == null ? "null"
                         : esc(m.look.getDeclaringClass().getName() + "." + m.look.getName() + "() -> " + m.look.getReturnType().getName()))
+                 .append(", \"healthMethod\": ").append(m.healthMethod == null ? "null"
+                        : esc(m.healthMethod.getDeclaringClass().getName() + "." + m.healthMethod.getName() + "()"))
                  .append('}');
             }
             b.append("\n  ]\n}\n");
             File dir = new File(cfg.exportDir);
             if (!dir.isDirectory()) dir.mkdirs();
-            File out = new File(dir, "mcradar_layout.json");
+            File out = new File(dir, "esp_layout.json");
             FileOutputStream fos = new FileOutputStream(out);
             try { fos.write(b.toString().getBytes("UTF-8")); } finally { fos.close(); }
         } catch (Throwable t) {

@@ -1,44 +1,45 @@
-// ProcessManager.h - locate the Minecraft JVM and own the process handle.
+// ProcessManager.h - finds the Minecraft JVM (port of ProcessScanner.cs + the PID logic of the radar).
+//
+// A Minecraft client is a java.exe / javaw.exe process that owns a visible window titled "Minecraft...".
+// With two clients on one PC (LAN test with 2 accounts) there are two such processes: Scan() lists
+// them all and --pid <PID> picks one.
 #pragma once
 #include "Platform.h"
 #include "RaiiHandle.h"
-#include <optional>
+#include <filesystem>
 #include <string>
+#include <vector>
 
-class ProcessManager {
+struct JavaProcess
+{
+    DWORD pid = 0;
+    HWND hwnd = nullptr; // main (game) window, may be null while the game is starting
+    std::string title;
+    std::filesystem::path exe; // ...\bin\javaw.exe
+    std::filesystem::path javaExe; // ...\bin\java.exe next to it (what runs the attach helper)
+    std::string versionHint; // from the window title, e.g. "1.21.1" (may be empty)
+    std::string DisplayName() const;
+};
+
+class ProcessManager
+{
 public:
-    ProcessManager() = default;
-    ~ProcessManager() = default;                       // UniqueHandle closes the handle
-    ProcessManager(const ProcessManager&) = delete;
-    ProcessManager& operator=(const ProcessManager&) = delete;
+    // Every java(w).exe process, those with a "Minecraft" window first.
+    static std::vector<JavaProcess> Scan();
 
-    // Find the Minecraft JVM and open it with PROCESS_VM_READ | PROCESS_QUERY_INFORMATION.
-    // Returns false (quietly) if Minecraft isn't running, so it can be polled safely.
-    bool Attach();
-    void Detach();
-
-    // Use this PID instead of auto-detecting (needed with two Minecraft clients on one PC).
-    // 0 = auto-detect.
     void SetForcedPid(DWORD pid) { forcedPid_ = pid; }
-
+    bool Attach(); // pick target (forced PID, else first Minecraft-looking one)
+    void Detach();
     bool IsAttached() const { return handle_.valid(); }
-    // False once the target has exited (handle still valid but process is dead).
-    bool IsAlive() const;
-
-    HANDLE Handle() const { return handle_.get(); }
-    DWORD Pid() const { return pid_; }
-
-    // Base address of a loaded module in the target (e.g. "jvm.dll").
-    std::optional<uintptr_t> ModuleBase(const std::string& moduleName) const;
-
-    // Strategy 1: visible top-level window whose title starts with "Minecraft" AND whose
-    //             owning process is java.exe/javaw.exe (this excludes the launcher).
-    // Strategy 2: fall back to any java.exe / javaw.exe process.
-    static std::optional<DWORD> FindMinecraftPid();
+    bool IsAlive() const; // false once the process exited
+    const JavaProcess& Target() const { return target_; }
+    // Re-resolves the game window (cheap, throttled). Returns it (may be null).
+    HWND RefreshWindow();
 
 private:
-    UniqueHandle handle_;
-    DWORD pid_ = 0;
+    UniqueHandle handle_; // SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION only: we never read its memory
+    JavaProcess target_;
+    DWORD forcedPid_ = 0;
     DWORD lastFailedPid_ = 0;
-    DWORD forcedPid_ = 0;  // avoid spamming the same OpenProcess error every second
+    ULONGLONG lastWindowRefresh_ = 0;
 };
