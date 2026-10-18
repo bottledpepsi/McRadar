@@ -14,8 +14,7 @@ namespace elog
     enum class Level { Info, Warn, Error };
 
     void Init(); // trim old log, write session banner
-    ESP_PRINTF(2, 3)
-    void Write(Level lvl, const char* fmt, ...);
+    ESP_PRINTF(2, 3) void Write(Level lvl, const char* fmt, ...);
 } // namespace elog
 
 #define LOG_INFO(...)  ::elog::Write(::elog::Level::Info, __VA_ARGS__)

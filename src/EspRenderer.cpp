@@ -1,7 +1,9 @@
 #include "EspRenderer.h"
 #include "Avatar.h"
 #include "FriendList.h"
+#include "ItemText.h"
 #include "Presets.h"
+#include "SkinCache.h"
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -54,9 +56,19 @@ void EspRenderer::DrawLabels(Gfx& g, const Settings& s, const PlayerState& p, fl
             // avatar placeholder (see Avatar.h)
             const float tw = g.TextWidth(p.name, f);
             const float a = px + 2.f, ax = cx - tw * 0.5f - a - 4.f;
-            const AvatarColor ac = AvatarColorFor(p.name);
-            g.FillRRect(ax, y + 1, a, a, 2.f, Col{ac.r, ac.g, ac.b, 0.9f});
-            g.TextCentered(AvatarInitial(p.name), ax + a * 0.5f, y + 1, Font::Hint, Col{1, 1, 1, 1});
+            SkinCache::Request(p.name, p.uuid); // idempotent; fetches the skin face in the background
+            if (auto img = SkinCache::Get(p.name))
+            {
+                g.DrawImage(*img, ax, y + 1, a, a);
+                g.Rect(ax - 0.5f, y + 0.5f, a + 1.f, a + 1.f, kFriend.with(0.8f), 1.f);
+            }
+            else
+            {
+                // loading / offline player: letter placeholder
+                const AvatarColor ac = AvatarColorFor(p.name);
+                g.FillRRect(ax, y + 1, a, a, 2.f, Col{ac.r, ac.g, ac.b, 0.9f});
+                g.TextCentered(AvatarInitial(p.name), ax + a * 0.5f, y + 1, Font::Hint, Col{1, 1, 1, 1});
+            }
         }
     }
     if (s.distFmtIdx < 2) g.TextCentered(DistText(s, dist), cx, bottom + 3.f, Font::UiSmall, kDistText, s.textShadow);
@@ -93,11 +105,12 @@ void EspRenderer::DrawSkeleton(Gfx& g, const Settings& s, const Camera& cam, con
                                bool isFriend)
 {
     const double yaw = p.yawValid ? p.yawDeg * kDeg2Rad : 0.0;
+    const double sy = (p.sizeValid ? p.height : kPlayerH) / kPlayerH; // sneaking players are shorter
     const double rx = -std::cos(yaw), rz = -std::sin(yaw); // player's right
     const double fx = -std::sin(yaw), fz = std::cos(yaw); // player's forward
     auto J = [&](double side, double fwd, double y)
     {
-        return Vec3{p.pos.x + rx * side + fx * fwd, p.pos.y + y, p.pos.z + rz * side + fz * fwd};
+        return Vec3{p.pos.x + rx * side + fx * fwd, p.pos.y + y * sy, p.pos.z + rz * side + fz * fwd};
     };
     float tx, ty;
     if (!cam.Project(J(0, 0, 0.9), tx, ty)) return; // body centre must be in front of the camera
@@ -147,21 +160,21 @@ void EspRenderer::DrawPlayer(Gfx& g, const Settings& s, const Camera& cam, const
         return;
     }
 
+    const double ph = p.sizeValid ? p.height : kPlayerH, pw = p.sizeValid ? p.width : kPlayerW;
+    // the game's hitbox when known
     float cx, cy;
-    if (!cam.Project({p.pos.x, p.pos.y + kPlayerH * 0.5, p.pos.z}, cx, cy)) return; // centre behind camera -> skip
+    if (!cam.Project({p.pos.x, p.pos.y + ph * 0.5, p.pos.z}, cx, cy)) return; // centre behind camera -> skip
 
     // Project the 8 AABB corners; corners that straddle the camera plane are clamped to the near plane.
-    const double hw = kPlayerW * 0.5;
+    const double hw = pw * 0.5;
     float minX = 1e9f, minY = 1e9f, maxX = -1e9f, maxY = -1e9f;
     for (int xi = 0; xi < 2; ++xi)
         for (int yi = 0; yi < 2; ++yi)
             for (int zi = 0; zi < 2; ++zi)
             {
                 float sx, sy;
-                cam.ProjectClamped({
-                                       p.pos.x + (xi ? hw : -hw), p.pos.y + (yi ? kPlayerH : 0.0),
-                                       p.pos.z + (zi ? hw : -hw)
-                                   }, sx, sy);
+                cam.ProjectClamped({p.pos.x + (xi ? hw : -hw), p.pos.y + (yi ? ph : 0.0), p.pos.z + (zi ? hw : -hw)},
+                                   sx, sy);
                 minX = std::min(minX, sx);
                 maxX = std::max(maxX, sx);
                 minY = std::min(minY, sy);
@@ -218,8 +231,9 @@ void EspRenderer::DrawPlayer(Gfx& g, const Settings& s, const Camera& cam, const
 
 void EspRenderer::DrawItem(Gfx& g, const Settings& s, const Camera& cam, const ItemState& it, float dist)
 {
+    const double iw = it.sizeValid ? it.width : 0.25, ih = it.sizeValid ? it.height : 0.25;
     float cx, cy;
-    if (!cam.Project({it.pos.x, it.pos.y + 0.15, it.pos.z}, cx, cy)) return;
+    if (!cam.Project({it.pos.x, it.pos.y + ih * 0.5, it.pos.z}, cx, cy)) return;
     float minX = 1e9f, minY = 1e9f, maxX = -1e9f, maxY = -1e9f;
     for (int xi = 0; xi < 2; ++xi)
         for (int yi = 0; yi < 2; ++yi)
@@ -227,8 +241,8 @@ void EspRenderer::DrawItem(Gfx& g, const Settings& s, const Camera& cam, const I
             {
                 float sx, sy;
                 cam.ProjectClamped({
-                                       it.pos.x + (xi ? 0.2 : -0.2), it.pos.y + (yi ? 0.3 : 0.0),
-                                       it.pos.z + (zi ? 0.2 : -0.2)
+                                       it.pos.x + (xi ? iw * 0.5 : -iw * 0.5), it.pos.y + (yi ? ih : 0.0),
+                                       it.pos.z + (zi ? iw * 0.5 : -iw * 0.5)
                                    }, sx, sy);
                 minX = std::min(minX, sx);
                 maxX = std::max(maxX, sx);
@@ -236,13 +250,59 @@ void EspRenderer::DrawItem(Gfx& g, const Settings& s, const Camera& cam, const I
                 maxY = std::max(maxY, sy);
             }
     if (maxX - minX < 2.f || maxY - minY < 2.f) return;
+    if (maxX < 0 || minX > cam.w || maxY < 0 || minY > cam.h) return;
     const float op = presets::TraceOpacities[s.itemOpacityIdx];
-    g.Rect(minX, minY, maxX - minX, maxY - minY, Col{1, 1, 1, op}, 1.f);
-    if (s.showItemNames && dist <= presets::LabelDist[s.labelDistIdx])
+    const bool enchanted = !it.enchants.empty();
+    const Col boxCol = enchanted ? Col{0.62f, 0.78f, 1.f, op} : Col{1, 1, 1, op};
+    g.Rect(minX, minY, maxX - minX, maxY - minY, boxCol, 1.f);
+    if (dist > presets::LabelDist[s.labelDistIdx]) return;
+
+    // Label, reading top to bottom: name xN / enchantments / tags. Drawn bottom-up so the last line sits on the box.
+    struct Line
     {
-        std::string label = it.name;
+        std::string text;
+        Col col;
+        Font font;
+    };
+    std::vector<Line> lines;
+    if (s.showItemNames)
+    {
+        std::string label = PrettyItemName(it.key);
         if (s.showItemCount && it.count > 1) label += " x" + std::to_string(it.count);
-        g.TextCentered(label, (minX + maxX) * 0.5f, minY - 17.f, Font::Name13, Col{1, 1, 1, op}, s.textShadow);
+        lines.push_back({label, boxCol, Font::Name13});
+    }
+    if (s.showItemEnchants)
+    {
+        size_t shown = 0;
+        for (const Enchant& e : it.enchants)
+        {
+            if (shown++ >= 6)
+            {
+                lines.push_back({
+                    "+" + std::to_string(it.enchants.size() - 6) + " more", Col{0.7f, 0.7f, 0.85f, op}, Font::UiSmall
+                });
+                break;
+            }
+            lines.push_back({
+                PrettyEnchant(e), IsCurse(e) ? Col{1.f, 0.45f, 0.45f, op} : Col{0.80f, 0.62f, 1.f, op}, Font::UiSmall
+            });
+        }
+    }
+    if (s.showItemTags && !it.tags.empty())
+    {
+        // raw NBT / component text, wrapped, at most 3 lines
+        for (size_t pos = 0, n = 0; pos < it.tags.size() && n < 3; pos += 58, ++n)
+            lines.push_back({
+                it.tags.substr(pos, 58) + (n == 2 && pos + 58 < it.tags.size() ? "..." : ""),
+                Col{0.62f, 0.66f, 0.75f, op * 0.9f}, Font::Hint
+            });
+    }
+    float y = minY - 4.f;
+    for (auto ln = lines.rbegin(); ln != lines.rend(); ++ln)
+    {
+        const float lh = ln->font == Font::Name13 ? 17.f : 14.f;
+        y -= lh;
+        g.TextCentered(ln->text, (minX + maxX) * 0.5f, y, ln->font, ln->col, s.textShadow);
     }
 }
 
@@ -268,11 +328,12 @@ void EspRenderer::DrawWorld(Gfx& g, const Settings& s, const Camera& cam, const 
     if (s.showTracers)
         for (const auto& e : list)
         {
+            const double eh = e.p->sizeValid ? e.p->height : kPlayerH;
             const double ty = s.tracerTargetIdx == 0
                                   ? e.p->pos.y
                                   : s.tracerTargetIdx == 2
-                                  ? e.p->pos.y + kPlayerH
-                                  : e.p->pos.y + kPlayerH * 0.5;
+                                  ? e.p->pos.y + eh
+                                  : e.p->pos.y + eh * 0.5;
             DrawTracer(g, s, cam, {e.p->pos.x, ty, e.p->pos.z}, e.dist, e.fr);
         }
     if (s.showPlayers)
@@ -281,7 +342,8 @@ void EspRenderer::DrawWorld(Gfx& g, const Settings& s, const Camera& cam, const 
     if (s.showItems)
         for (const auto& it : snap.items)
         {
-            if (s.hideJunk && presets::IsJunkItem(it.name)) continue;
+            if (s.hideJunk && presets::IsJunkItem(PrettyItemName(it.key))) continue;
+            // junk list uses display names ("Rotten Flesh")
             DrawItem(g, s, cam, it, static_cast<float>(cam.Distance(it.pos)));
         }
 }
@@ -301,13 +363,13 @@ void EspRenderer::DrawMinimap(Gfx& g, const Settings& s, const Camera& cam, cons
     g.Line(cx, y + 2, cx, y + mm - 2, line, 0.5f);
     g.Line(x + 2, cy, x + mm - 2, cy, line, 0.5f);
 
+    const Vec3 center = snap.localValid ? snap.local.pos : cam.eye; // in third person the camera is not at the player
     const float scale = (r - 4.f) / range;
     const float maxDist = presets::PlayerDist[s.maxPlayerDistIdx];
     for (const auto& p : snap.players)
     {
         if (cam.Distance(p.pos) > maxDist) continue;
-        float dx = static_cast<float>(p.pos.x - cam.eye.x) * scale, dz = static_cast<float>(p.pos.z - cam.eye.z) *
-                  scale;
+        float dx = static_cast<float>(p.pos.x - center.x) * scale, dz = static_cast<float>(p.pos.z - center.z) * scale;
         const float d = std::hypot(dx, dz);
         if (d > r - 4.f)
         {

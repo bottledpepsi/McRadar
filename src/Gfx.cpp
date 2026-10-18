@@ -96,6 +96,7 @@ bool Gfx::Init()
 
 bool Gfx::CreateRenderTarget()
 {
+    bitmaps_.clear(); // device resources belong to the old render target
     brush_.reset();
     rt_.reset();
     D2D1_RENDER_TARGET_PROPERTIES p{};
@@ -260,6 +261,27 @@ void Gfx::FillTriangle(float x1, float y1, float x2, float y2, float x3, float y
     sink->Close();
     SetBrush(c);
     rt_->FillGeometry(g.get(), brush_.get());
+}
+
+void Gfx::DrawImage(const Image& img, float x, float y, float w, float h, float opacity)
+{
+    if (img.bgra.empty() || img.w <= 0 || img.h <= 0) return;
+    auto it = bitmaps_.find(img.id);
+    if (it == bitmaps_.end())
+    {
+        if (bitmaps_.size() > 128) bitmaps_.clear();
+        D2D1_BITMAP_PROPERTIES bp{};
+        bp.pixelFormat = D2D1_PIXEL_FORMAT{DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED};
+        bp.dpiX = bp.dpiY = 96.f;
+        ComPtr<ID2D1Bitmap> bmp;
+        if (FAILED(rt_->CreateBitmap(D2D1_SIZE_U{static_cast<UINT32>(img.w), static_cast<UINT32>(img.h)},
+                                     img.bgra.data(),
+                                     static_cast<UINT32>(img.w) * 4, &bp, bmp.put())))
+            return;
+        it = bitmaps_.emplace(img.id, std::move(bmp)).first;
+    }
+    D2D1_RECT_F d = RectF(x, y, w, h);
+    rt_->DrawBitmap(it->second.get(), &d, opacity, D2D1_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR, nullptr);
 }
 
 void Gfx::PushClip(float x, float y, float w, float h)

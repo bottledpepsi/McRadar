@@ -1,12 +1,12 @@
-// Wire.h - parser for the agent's UDP datagrams (see agent/src/mcradar/Snapshot.java).
+// Wire.h - parser for the agent's UDP datagrams (the format is documented in agent/src/mcradar/Snapshot.java).
 //
-//   MCRADAR 2
+//   MCRADAR 3
 //   S <status text>
-//   L <name> <x> <y> <z> <yaw|-> <pitch|-> <health|->     local player (optional)
-//   P <name> <x> <y> <z> <yaw|-> <pitch|-> <health|->     other player, one line each
-//   I <name> <count> <x> <y> <z>                          dropped item (reserved; not sent by the agent yet)
-// "MCRADAR 1" (no pitch/health columns) is accepted too. '-' = unknown. Names never contain spaces
-// (the agent replaces them with '_').
+//   C <x> <y> <z> <yaw> <pitch> <fov|-> <mode>                          the game camera (mode 1 first / 2 third-back / 3 third-front)
+//   L <name> <x> <y> <z> <yaw|-> <pitch|-> <health|-> <w|-> <h|-> <uuid|->   local player
+//   P <name> ...same columns...                                         other players
+//   I <x> <y> <z> <w|-> <h|-> <count> <key> <ench|-> <tags|->           dropped item; key/ench/tags percent-encoded
+// "MCRADAR 1" (yaw only) and "MCRADAR 2" (+ pitch, health) are still accepted. '-' = unknown.
 #pragma once
 #include "Types.h"
 

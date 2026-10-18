@@ -10,13 +10,13 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 add_executable(mcesp
-        src/main.cpp src/Logger.cpp src/Json.cpp src/Presets.cpp src/EspConfig.cpp
-        src/FriendList.cpp src/ProfileManager.cpp src/Wire.cpp
-        src/ProcessManager.cpp src/AgentInjector.cpp src/AgentSupervisor.cpp src/UdpListener.cpp
-        src/Gfx.cpp src/EspRenderer.cpp src/ConfigUi.cpp src/EspOverlay.cpp)
+  src/main.cpp src/Logger.cpp src/Json.cpp src/Presets.cpp src/EspConfig.cpp
+  src/FriendList.cpp src/ProfileManager.cpp src/Wire.cpp src/SkinCache.cpp
+  src/ProcessManager.cpp src/AgentInjector.cpp src/AgentSupervisor.cpp src/UdpListener.cpp
+  src/Gfx.cpp src/EspRenderer.cpp src/ConfigUi.cpp src/EspOverlay.cpp)
 
 # Console subsystem on purpose (logs are visible in the terminal): do NOT add -mwindows.
-target_link_libraries(mcesp PRIVATE d2d1 dwrite dwmapi winmm gdi32 user32 ws2_32)
+target_link_libraries(mcesp PRIVATE d2d1 dwrite dwmapi winmm gdi32 user32 ws2_32 winhttp windowscodecs ole32 uuid)
 
 # Default OFF: a fully static link (-static) fails on newer MinGW-w64 toolchains such as CLion 2026's bundled
 # GCC 15 (undefined __intrinsic_setjmpex / __ms_vsnprintf from libpthread.a / libmsvcrt.a). The default links
@@ -32,7 +32,7 @@ if(MINGW)
     get_filename_component(_cxx_dir "${CMAKE_CXX_COMPILER}" DIRECTORY)
     if(EXISTS "${_cxx_dir}/libwinpthread-1.dll")
       add_custom_command(TARGET mcesp POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_if_different
-              "${_cxx_dir}/libwinpthread-1.dll" $<TARGET_FILE_DIR:mcesp>/libwinpthread-1.dll)
+        "${_cxx_dir}/libwinpthread-1.dll" $<TARGET_FILE_DIR:mcesp>/libwinpthread-1.dll)
     endif()
   endif()
 else()
@@ -42,7 +42,7 @@ endif()
 # The Java agent (build it first: agent/build.bat) must sit next to the exe.
 if(EXISTS ${CMAKE_SOURCE_DIR}/agent/esp-agent.jar)
   add_custom_command(TARGET mcesp POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_if_different
-          ${CMAKE_SOURCE_DIR}/agent/esp-agent.jar $<TARGET_FILE_DIR:mcesp>/esp-agent.jar)
+    ${CMAKE_SOURCE_DIR}/agent/esp-agent.jar $<TARGET_FILE_DIR:mcesp>/esp-agent.jar)
 else()
   message(WARNING "agent/esp-agent.jar not found - run agent/build.bat (needs a JDK) before building.")
 endif()

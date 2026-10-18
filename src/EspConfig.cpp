@@ -38,8 +38,8 @@ std::string EspConfig::ToJson() const
     j += Kv("ShowMinimap", B(ShowMinimap)) + Kv("MinimapSize", N(MinimapSize)) + Kv("MinimapRange", N(MinimapRange));
     j += Kv("OverlayOpacity", N(OverlayOpacity)) + Kv("FpsCap", N(FpsCap));
     j += Kv("ConfigX", N(ConfigX)) + Kv("ConfigY", N(ConfigY));
-    j += Kv("Fov", N(Fov)) + Kv("VSync", B(VSync)) + Kv("Smoothing", B(Smoothing)) + Kv(
-        "ShowHealth", B(ShowHealth), true);
+    j += Kv("Fov", N(Fov)) + Kv("VSync", B(VSync)) + Kv("Smoothing", B(Smoothing)) + Kv("ShowHealth", B(ShowHealth)) +
+        Kv("ShowItemEnchants", B(ShowItemEnchants)) + Kv("ShowItemTags", B(ShowItemTags), true);
     return j + "}\n";
 }
 
@@ -85,6 +85,8 @@ EspConfig EspConfig::FromJson(const json::Object& o)
     c.VSync = GetBool(o, "VSync", c.VSync);
     c.Smoothing = GetBool(o, "Smoothing", c.Smoothing);
     c.ShowHealth = GetBool(o, "ShowHealth", c.ShowHealth);
+    c.ShowItemEnchants = GetBool(o, "ShowItemEnchants", c.ShowItemEnchants);
+    c.ShowItemTags = GetBool(o, "ShowItemTags", c.ShowItemTags);
     return c;
 }
 
@@ -140,6 +142,8 @@ void Settings::Apply(const EspConfig& c)
     vsync = c.VSync;
     smoothing = c.Smoothing;
     showHealth = c.ShowHealth;
+    showItemEnchants = c.ShowItemEnchants;
+    showItemTags = c.ShowItemTags;
 }
 
 EspConfig Settings::Build() const
@@ -184,6 +188,8 @@ EspConfig Settings::Build() const
     c.VSync = vsync;
     c.Smoothing = smoothing;
     c.ShowHealth = showHealth;
+    c.ShowItemEnchants = showItemEnchants;
+    c.ShowItemTags = showItemTags;
     return c;
 }
 

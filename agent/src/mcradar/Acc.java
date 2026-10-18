@@ -55,6 +55,21 @@ final class Acc {
         } catch (Throwable t) { return Double.NaN; }
     }
 
+    float getFloat(Object o) {
+        try {
+            if (o == null || !owner.isInstance(o)) return Float.NaN;
+            return unsafe ? Mem.getFloat(o, off) : f.getFloat(o);
+        } catch (Throwable t) { return Float.NaN; }
+    }
+
+    /** Integer field; Integer.MIN_VALUE when unreadable. */
+    int getInt(Object o) {
+        try {
+            if (o == null || !owner.isInstance(o)) return Integer.MIN_VALUE;
+            return unsafe ? Mem.getInt(o, off) : f.getInt(o);
+        } catch (Throwable t) { return Integer.MIN_VALUE; }
+    }
+
     String describe() {
         return owner.getName() + "." + f.getName() + " : " + f.getType().getName()
                 + (isStatic ? " [static]" : "") + (off >= 0 ? " @offset " + off : "");

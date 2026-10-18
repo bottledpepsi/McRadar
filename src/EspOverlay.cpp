@@ -3,6 +3,7 @@
 #include "Logger.h"
 #include "Presets.h"
 #include "ProfileManager.h"
+#include "SkinCache.h"
 #include <dwmapi.h>
 #include <algorithm>
 #include <cstdio>
@@ -283,6 +284,7 @@ int EspOverlay::Run()
     }
     if (!CreateOverlayWindow()) return 1;
     if (!opt_.demo && !udp_.Start()) LOG_ERROR("Agent data will not be received (UDP listener failed).");
+    SkinCache::Start(); // friend avatars (background downloads)
     timeBeginPeriod(1); // 1 ms sleep granularity for the frame limiter
     LOG_INFO("Overlay running. Insert = config, Delete = toggle, hold End = exit. %s", opt_.demo ? "(DEMO)" : "");
 
@@ -330,6 +332,7 @@ int EspOverlay::Run()
         Pace(frameStart);
     }
     timeEndPeriod(1);
+    SkinCache::Stop();
     LOG_INFO("Overlay stopped.");
     return 0;
 }
@@ -364,19 +367,46 @@ void EspOverlay::RenderFrame(const RECT& r, bool /*gameFocused*/)
     const bool stale = !opt_.demo && (udp_.LastPacketTime() == Clock::time_point{} || now - udp_.LastPacketTime() >
         1500ms);
 
-    // ---- 2. camera reconstructed from the local player (see Camera.h) ----
+    // ---- 2. camera ----
+    // Preferred: the game's own camera as read by the agent - exact position (first or third person), exact
+    // angles and the exact current FOV (sprint / speed / underwater effects included).
+    // Fallback: reconstructed from the local player's eye + angles with the FOV from the config (see Camera.h).
     Camera cam;
-    const bool haveCam = !stale && snap.localValid && snap.local.yawValid && snap.local.pitchValid;
-    if (haveCam)
+    bool haveCam = false, exactCam = false;
+    std::string camInfo = "Camera: waiting for data";
+    static const char* const kModes[] = {"", "first person", "third person (behind)", "third person (in front)"};
+    if (!stale && snap.camera.valid)
+    {
+        const CameraState& c = snap.camera;
+        cam.eye = c.pos;
+        cam.yawDeg = c.yawDeg;
+        cam.pitchDeg = c.pitchDeg;
+        cam.fovYDeg = c.fovValid ? c.fovDeg : presets::Fovs[settings_.fovIdx];
+        haveCam = exactCam = true;
+        char b[160];
+        if (c.fovValid) std::snprintf(b, sizeof b, "Camera: exact from the game - FOV %.1f, %s", c.fovDeg,
+                                      kModes[c.mode]);
+        else std::snprintf(b, sizeof b, "Camera: exact pose from the game, FOV from config (%d) - %s",
+                           presets::Fovs[settings_.fovIdx], kModes[c.mode]);
+        camInfo = b;
+    }
+    else if (!stale && snap.localValid && snap.local.yawValid && snap.local.pitchValid)
     {
         cam.eye = {snap.local.pos.x, snap.local.pos.y + Camera::kEyeHeight, snap.local.pos.z};
         cam.yawDeg = snap.local.yawDeg;
         cam.pitchDeg = snap.local.pitchDeg;
         cam.fovYDeg = presets::Fovs[settings_.fovIdx];
+        haveCam = true;
+        camInfo =
+            "Camera: reconstructed (player pose + config FOV). Turn your head so the agent finds the game camera.";
+    }
+    if (haveCam)
+    {
         cam.w = w;
         cam.h = h;
         cam.Update();
     }
+    ui_.SetCameraInfo(camInfo);
 
     // ---- 3. draw into the off-screen surface ----
     // While the config window is open the whole surface is given alpha 1/255: invisible, but hit-testable,
@@ -410,10 +440,15 @@ void EspOverlay::RenderFrame(const RECT& r, bool /*gameFocused*/)
         gfx_.Text(line, 10, 8, Font::Ui, Col{0.80f, 0.85f, 1.f, 0.95f}, true);
     }
     std::string status = sup_.Status();
+    if (haveCam && !opt_.demo) status += exactCam
+                                             ? (snap.camera.mode == 1
+                                                    ? "  |  cam: exact"
+                                                    : "  |  cam: exact, third person")
+                                             : "  |  cam: reconstructed";
     if (!opt_.demo && !snap.status.empty() && !stale) status += "  |  " + snap.status;
     gfx_.Text(status, 10, 26, Font::UiSmall, Col{0.62f, 0.67f, 0.80f, 0.9f}, true);
     if (!opt_.demo && !stale && snap.localValid && !haveCam)
-        gfx_.Text("heading unavailable: the agent could not find the look-vector method (see esp_layout.json)", 10, 42,
+        gfx_.Text("camera unavailable: the agent could not find the look-vector method (see esp_layout.json)", 10, 42,
                   Font::UiSmall, Col{1.f, 0.6f, 0.4f, 1.f}, true);
     if (haveCam && visible_ && snap.players.empty() && !opt_.demo)
         gfx_.Text("no other players in range", 10, 42, Font::UiSmall, Col{0.55f, 0.6f, 0.72f, 0.8f}, true);

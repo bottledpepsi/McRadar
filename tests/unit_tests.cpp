@@ -1,5 +1,6 @@
 #include <cstring>
 #include "Camera.h"
+#include "ItemText.h"
 #include "EspConfig.h"
 #include "FriendList.h"
 #include "Presets.h"
@@ -105,6 +106,70 @@ int main() {
     CHECK(near(pr.players[0].pos.x, 1.0, 1e-3)); CHECK(near(pr.players[0].yawDeg, -177, 1e-2));
     CHECK(near(sm.Predict(b.arrived + std::chrono::milliseconds(500), true).players[0].pos.x, 1.5, 1e-3));   // capped at 100 ms of look-ahead
     CHECK(near(sm.Predict(b.arrived + std::chrono::milliseconds(50), false).players[0].pos.x, 0.5, 1e-9));   // disabled
+
+
+    // --- Wire v3: camera, hitbox, uuid, items (percent-encoded tags) -----------------------------------
+    {
+        const char* v3 =
+            "MCRADAR 3\nS agent ok\n"
+            "C 97.9276 65.6200 -45.4497 -175.83 18.91 68.02 2\n"
+            "L Alice 100.000 64.000 -50.000 -175.83 18.91 20.00 0.60 1.80 8667d4ae-9e7c-3f2d-a1b2-c3d4e5f60718\n"
+            "P Carol 90.000 70.000 -60.000 90.00 20.00 17.50 0.60 1.50 069a79f4-44e9-4726-a5be-fca90e38aaf5\n"
+            "I 103.000 64.000 -47.000 0.25 0.25 1 minecraft:diamond_sword minecraft:sharpness@5,minecraft:unbreaking@3 %7BEnchantments:%5B%7Bid:%22minecraft:sharpness%22%7D%5D%7D\n"
+            "I 98.000 64.000 -52.000 - - 37 minecraft:cobblestone - -\n";
+        WorldSnapshot w3;
+        CHECK(ParseDatagram(v3, std::strlen(v3), w3));
+        CHECK(w3.camera.valid && w3.camera.fovValid && near(w3.camera.fovDeg, 68.02) && w3.camera.mode == 2 && near(w3.camera.pos.y, 65.62, 1e-3));
+        CHECK(w3.localValid && w3.local.sizeValid && near(w3.local.height, 1.8) && w3.local.uuid == "8667d4ae-9e7c-3f2d-a1b2-c3d4e5f60718");
+        CHECK(w3.players.size() == 1 && w3.players[0].sizeValid && near(w3.players[0].height, 1.5) && w3.players[0].uuid[14] == '4');
+        CHECK(w3.items.size() == 2);
+        CHECK(w3.items[0].key == "minecraft:diamond_sword" && w3.items[0].count == 1 && w3.items[0].sizeValid && w3.items[0].enchants.size() == 2);
+        CHECK(w3.items[0].enchants[0].id == "minecraft:sharpness" && w3.items[0].enchants[0].level == 5 && w3.items[0].enchants[1].level == 3);
+        CHECK(w3.items[0].tags == "{Enchantments:[{id:\"minecraft:sharpness\"}]}");           // %XX decoding incl. quotes/braces
+        CHECK(w3.items[1].count == 37 && !w3.items[1].sizeValid && w3.items[1].enchants.empty() && w3.items[1].tags.empty());
+        // v3 camera line without FOV, and a v2 packet still parses (no camera, no size)
+        const char* nofov = "MCRADAR 3\nC 1 2 3 10 20 - 1\n";
+        WorldSnapshot wn; CHECK(ParseDatagram(nofov, std::strlen(nofov), wn) && wn.camera.valid && !wn.camera.fovValid);
+        const char* v2b = "MCRADAR 2\nL A 1 2 3 4 5 6\nP B 4 5 6 - - -\n";
+        WorldSnapshot w2; CHECK(ParseDatagram(v2b, std::strlen(v2b), w2) && !w2.camera.valid && !w2.local.sizeValid && w2.local.uuid.empty());
+    }
+
+    // --- item text helpers --------------------------------------------------------------------------
+    CHECK(PrettyItemName("minecraft:diamond_sword") == "Diamond Sword");
+    CHECK(PrettyItemName("diamondSword") == "Diamond Sword");
+    CHECK(PrettyItemName("minecraft:potion.effect.healing") == "Potion (Healing)");
+    CHECK(PrettyItemName("mymod:ruby_ore") == "Ruby Ore");
+    CHECK(PrettyEnchant({"minecraft:sharpness", 5}) == "Sharpness V");
+    CHECK(PrettyEnchant({"minecraft:mending", 1}) == "Mending");
+    CHECK(PrettyEnchant({"minecraft:binding_curse", 1}) == "Binding Curse" && IsCurse({"minecraft:binding_curse", 1}));
+    CHECK(PrettyEnchant({"minecraft:efficiency", 12}) == "Efficiency 12");
+    CHECK(PrettyEnchant({"16", 3}) == "Enchant #16 III");
+    CHECK(PercentDecode("-").empty() && PercentDecode("a%20b") == "a b" && PercentDecode("100%") == "100%");
+    CHECK(presets::IsJunkItem(PrettyItemName("minecraft:rotten_flesh")) && !presets::IsJunkItem(PrettyItemName("minecraft:diamond")));
+
+    // --- new config keys round trip and default when absent (older files) --------------------------------
+    {
+        Settings a; a.showItemEnchants = false; a.showItemTags = true;
+        auto o3 = json::ParseObject(a.Build().ToJson());
+        Settings b; b.Apply(EspConfig::FromJson(*o3));
+        CHECK(!b.showItemEnchants && b.showItemTags);
+        auto old = json::ParseObject("{\"BoxStyle\":\"Sharp\"}");
+        Settings c; c.Apply(EspConfig::FromJson(*old));
+        CHECK(c.showItemEnchants && !c.showItemTags);
+    }
+
+    // --- Smoother extrapolates the camera too (and not across a perspective switch) ----------------------
+    {
+        Smoother sm2; WorldSnapshot a, b; auto t0 = Smoother::Clock::now();
+        a.camera.valid = b.camera.valid = true; a.camera.mode = b.camera.mode = 1;
+        a.camera.pos = {0, 0, 0}; b.camera.pos = {0.5, 0, 0}; a.camera.yawDeg = 179; b.camera.yawDeg = -179;
+        a.arrived = t0; b.arrived = t0 + std::chrono::milliseconds(50);
+        sm2.Push(a); sm2.Push(b);
+        auto pr2 = sm2.Predict(b.arrived + std::chrono::milliseconds(50), true);
+        CHECK(near(pr2.camera.pos.x, 1.0) && near(pr2.camera.yawDeg, -177, 1e-2));
+        b.camera.mode = 2; Smoother sm3; sm3.Push(a); sm3.Push(b);
+        CHECK(near(sm3.Predict(b.arrived + std::chrono::milliseconds(50), true).camera.pos.x, 0.5));
+    }
 
     std::printf(fails ? "\n%d FAILURES\n" : "\nALL OK\n", fails);
     return fails;

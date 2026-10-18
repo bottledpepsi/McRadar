@@ -3,6 +3,7 @@
 #include "FriendList.h"
 #include "Presets.h"
 #include "ProfileManager.h"
+#include "SkinCache.h"
 #include <algorithm>
 #include <cmath>
 
@@ -132,12 +133,13 @@ void ConfigUi::TabGeneral()
     CycleRow("Overlay opacity", s_.overlayOpacityIdx, static_cast<int>(OverlayOpacity.size()),
              OverlayOpacityLabels[s_.overlayOpacityIdx]);
     CycleRow("FPS cap", s_.fpsCap, static_cast<int>(FpsCaps.size()), FpsCapLabels[s_.fpsCap]);
-    CycleRow("Camera FOV", s_.fovIdx, static_cast<int>(Fovs.size()), FovLabels[s_.fovIdx]);
+    CycleRow("Camera FOV (fallback)", s_.fovIdx, static_cast<int>(Fovs.size()), FovLabels[s_.fovIdx]);
     ToggleRow("VSync", s_.vsync);
     ToggleRow("Motion smoothing", s_.smoothing);
     y_ += 4;
-    InfoRow("FOV must match Minecraft's FOV option (sprinting / speed effects change it).");
-    InfoRow("Boxes drift from the players if it does not - adjust until they line up.");
+    if (!cameraInfo_.empty()) InfoRow(cameraInfo_);
+    InfoRow("With the game camera found, its exact pose and FOV are used (sprint, underwater, third person).");
+    InfoRow("The FOV setting is only a fallback.");
 }
 
 void ConfigUi::TabPlayers()
@@ -184,9 +186,17 @@ void ConfigUi::TabPlayers()
     for (const std::string& name : FriendList::Names())
     {
         const float a = 16.f;
-        const AvatarColor ac = AvatarColorFor(name); // avatar placeholder
-        g_->FillRRect(lx + 2, y_ + 2, a, a, 3.f, Col{ac.r, ac.g, ac.b, 0.95f});
-        g_->TextCentered(AvatarInitial(name), lx + 2 + a * 0.5f, y_ + 2.f, Font::UiSmall, Col{1, 1, 1, 1});
+        SkinCache::Request(name, ""); // real skin face (placeholder while loading)
+        if (auto img = SkinCache::Get(name))
+        {
+            g_->DrawImage(*img, lx + 2, y_ + 2, a, a);
+        }
+        else
+        {
+            const AvatarColor ac = AvatarColorFor(name);
+            g_->FillRRect(lx + 2, y_ + 2, a, a, 3.f, Col{ac.r, ac.g, ac.b, 0.95f});
+            g_->TextCentered(AvatarInitial(name), lx + 2 + a * 0.5f, y_ + 2.f, Font::UiSmall, Col{1, 1, 1, 1});
+        }
         g_->Text(name, lx + a + 10, y_ + 3, Font::Ui, Col{0.16f, 1.f, 0.35f, 1.f});
         if (Button("Remove", px_ + kW - 54 - kPad, 50)) { FriendList::Remove(name); }
         y_ += kRowH;
@@ -215,10 +225,12 @@ void ConfigUi::TabItems()
     ToggleRow("Item count", s_.showItemCount);
     CycleRow("Item opacity", s_.itemOpacityIdx, static_cast<int>(TraceOpacities.size()),
              TraceOpacityLabels[s_.itemOpacityIdx]);
+    ToggleRow("Item enchantments", s_.showItemEnchants);
+    ToggleRow("Item tags (raw NBT)", s_.showItemTags);
     ToggleRow("Hide junk items", s_.hideJunk);
     y_ += 6;
-    InfoRow("Note: the current agent only reports players. Item entities are not discovered yet;", true);
-    InfoRow("these settings are saved and will apply once an agent version sends items.", true);
+    InfoRow("Items, enchantments and tags are read from the game by the agent (nearest 48).");
+    InfoRow("Item frames / arrows (they also carry a stack) are filtered out by hitbox size.");
 }
 
 void ConfigUi::TabMinimap()

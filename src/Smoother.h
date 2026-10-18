@@ -46,6 +46,17 @@ public:
             if (c.pitchValid && p.pitchValid) c.pitchDeg += static_cast<float>((c.pitchDeg - p.pitchDeg) * f);
         };
         if (out.localValid && prev_.localValid) extrap(out.local, prev_.local);
+        if (out.camera.valid && prev_.camera.valid && out.camera.mode == prev_.camera.mode)
+        {
+            CameraState& c = out.camera;
+            const CameraState& p = prev_.camera;
+            c.pos.x += (c.pos.x - p.pos.x) * f;
+            c.pos.y += (c.pos.y - p.pos.y) * f;
+            c.pos.z += (c.pos.z - p.pos.z) * f;
+            c.yawDeg += static_cast<float>(Wrap(c.yawDeg - p.yawDeg) * f);
+            c.pitchDeg += static_cast<float>((c.pitchDeg - p.pitchDeg) * f);
+            if (c.fovValid && p.fovValid) c.fovDeg += static_cast<float>((c.fovDeg - p.fovDeg) * f);
+        }
         for (auto& pl : out.players)
         {
             auto it = prevByName_.find(pl.name);

@@ -30,6 +30,8 @@ public:
     }
 
     void Draw(Gfx& g, const UiInput& in, int winW, int winH);
+    void SetCameraInfo(const std::string& s) { cameraInfo_ = s; }
+    // shown in GENERAL (exact / reconstructed, FOV, perspective)
     bool CapturingKeys() const { return rebindActive_ || friendFocus_ || profileFocus_; }
 
     void ResetFocus()
@@ -72,6 +74,7 @@ private:
     bool dragging_ = false;
     float dragOffX_ = 0, dragOffY_ = 0;
 
+    std::string cameraInfo_;
     std::string friendInput_, profileInput_;
     bool friendFocus_ = false, profileFocus_ = false;
     bool rebindActive_ = false;

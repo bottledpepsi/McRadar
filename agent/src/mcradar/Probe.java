@@ -37,9 +37,9 @@ final class Probe {
         "cpw.mods.", "org.apache.logging."
     };
 
-    private final Instrumentation inst;
+    final Instrumentation inst;
     private final AgentConfig cfg;
-    private final String username;
+    final String username;
 
     private Class<?> gameProfile;
     private Method gpNameMethod;
@@ -50,11 +50,19 @@ final class Probe {
     private final Map<Class<?>, Boolean> playerCache = new HashMap<Class<?>, Boolean>();
     private final Map<Class<?>, Acc[]> refFieldCache = new HashMap<Class<?>, Acc[]>();
     private final Map<Class<?>, Acc> profileFieldCache = new HashMap<Class<?>, Acc>();
-    private final Map<Class<?>, Model> models = new HashMap<Class<?>, Model>();
+    final Map<Class<?>, Model> models = new HashMap<Class<?>, Model>();
     private final Map<Class<?>, Long> lastModelAttempt = new HashMap<Class<?>, Long>();
     private long lastModelRebuild;
 
-    private FieldPath containerPath, localPath;
+    FieldPath containerPath;
+    private FieldPath localPath;
+    private final AuxSearch aux = new AuxSearch(this);
+    private final CameraScanner camScan = new CameraScanner(this);
+    private final ItemScanner itemScan = new ItemScanner(this);
+    private boolean auxDone;
+    private long auxNextTry, lastItemPoll;
+    private List<Snapshot.Item> lastItems = new ArrayList<Snapshot.Item>();
+    private String exportedCam = "", exportedItems = "";
     private boolean ready;
     private int failTicks;
     private String status = "starting";
@@ -81,7 +89,7 @@ final class Probe {
 
     // ------------------------------------------------------------------ class classification
 
-    private static boolean isJdkish(Class<?> c) {
+    static boolean isJdkish(Class<?> c) {
         String n = c.getName();
         for (String p : SKIP) if (n.startsWith(p)) return true;
         return n.contains("$$Lambda") || n.contains("/0x");
@@ -96,7 +104,7 @@ final class Probe {
     }
 
     /** A class whose instances are "3 doubles and nothing else" (Vec3, Vec3d, Vector3d, ...). */
-    private boolean isVec3Like(Class<?> t) {
+    boolean isVec3Like(Class<?> t) {
         if (t.isPrimitive() || t.isArray() || t.isInterface() || isJdkish(t)) return false;
         Boolean b = vecCache.get(t);
         if (b != null) return b;
@@ -115,7 +123,7 @@ final class Probe {
     }
 
     /** Accessors for the (x, y, z) doubles of a Vec3-like class, in declaration order. */
-    private Acc[] vecAccessors(Class<?> t) {
+    Acc[] vecAccessors(Class<?> t) {
         if (vecAccCache.containsKey(t)) return vecAccCache.get(t);
         Acc[] out = null;
         try {
@@ -133,7 +141,7 @@ final class Probe {
         return out;
     }
 
-    private boolean isPlayerClass(Class<?> c) {
+    boolean isPlayerClass(Class<?> c) {
         Boolean b = playerCache.get(c);
         if (b != null) return b;
         boolean r = false;
@@ -157,7 +165,7 @@ final class Probe {
     }
 
     /** Non-static reference fields worth following when walking the object graph. */
-    private Acc[] refFieldsOf(Class<?> c) {
+    Acc[] refFieldsOf(Class<?> c) {
         Acc[] cached = refFieldCache.get(c);
         if (cached != null) return cached;
         List<Acc> l = new ArrayList<Acc>();
@@ -198,12 +206,12 @@ final class Probe {
         return roots;
     }
 
-    private static boolean isContainer(Object o) {
+    static boolean isContainer(Object o) {
         return o instanceof Collection || o instanceof Map || o instanceof Object[];
     }
 
     /** Snapshot of a container's elements; null on failure. Never iterates live (avoids CME). */
-    private static Object[] elements(Object o) {
+    static Object[] elements(Object o) {
         try {
             if (o instanceof Object[]) return ((Object[]) o).clone();
             if (o instanceof Collection) return ((Collection<?>) o).toArray();
@@ -214,7 +222,7 @@ final class Probe {
 
     // ------------------------------------------------------------------ player name
 
-    private String nameOf(Object player) {
+    String nameOf(Object player) {
         try {
             Class<?> c = player.getClass();
             Acc pf;
@@ -244,7 +252,7 @@ final class Probe {
 
     // ------------------------------------------------------------------ discovery (graph search)
 
-    private static final class Node {
+    static final class Node {
         final Object obj; final Node parent; final Acc via; final int depth;
         Node(Object obj, Node parent, Acc via, int depth) { this.obj = obj; this.parent = parent; this.via = via; this.depth = depth; }
     }
@@ -254,7 +262,7 @@ final class Probe {
         Cand(Node parent, Acc via, int depth, int count) { this.parent = parent; this.via = via; this.depth = depth; this.count = count; }
     }
 
-    private static FieldPath pathOf(Node parent, Acc last) {
+    static FieldPath pathOf(Node parent, Acc last) {
         LinkedList<Acc> l = new LinkedList<Acc>();
         if (last != null) l.addFirst(last);
         for (Node n = parent; n != null; n = n.parent) l.addFirst(n.via);
@@ -355,6 +363,7 @@ final class Probe {
 
         ready = true;
         failTicks = 0;
+        auxDone = false;
         status = "ok";
         Log.info("Discovery done in " + (System.currentTimeMillis() - t0) + " ms; " + best.count
                 + " player(s) in container at depth " + best.depth);
@@ -366,26 +375,45 @@ final class Probe {
 
     // ------------------------------------------------------------------ position / yaw model
 
-    private static final class PosCand {
+    static final class PosCand {
         final Acc vecField; final Acc[] xyz; final boolean vec;
         PosCand(Acc vecField, Acc[] xyz, boolean vec) { this.vecField = vecField; this.xyz = xyz; this.vec = vec; }
+
+        /** Reads x,y,z from `o` (a Vec3 field of o, or three double fields of o). false if unreadable/insane. */
+        boolean read(Object o, double[] out) {
+            if (vec) {
+                Object v = vecField.getObj(o);
+                if (v == null) return false;
+                for (int i = 0; i < 3; i++) out[i] = xyz[i].getDouble(v);
+            } else {
+                for (int i = 0; i < 3; i++) out[i] = xyz[i].getDouble(o);
+            }
+            return Model.sane(out);
+        }
     }
 
-    private static final class Model {
+    static final class Model {
         PosCand pos;
         Method look;
         Acc[] lookXyz;
         Method healthMethod;
+        Acc bbField;
+        Acc[] bbAcc;
 
-        boolean position(Object p, double[] o) {
-            if (pos.vec) {
-                Object v = pos.vecField.getObj(p);
-                if (v == null) return false;
-                for (int i = 0; i < 3; i++) o[i] = pos.xyz[i].getDouble(v);
-            } else {
-                for (int i = 0; i < 3; i++) o[i] = pos.xyz[i].getDouble(p);
-            }
-            return sane(o);
+        boolean position(Object p, double[] o) { return pos.read(p, o); }
+
+        /** Hitbox size from the entity's AABB-like field: out[0] = width, out[1] = height. false if unavailable. */
+        boolean size(Object p, float[] out) {
+            if (bbField == null) return false;
+            Object bb = bbField.getObj(p);
+            if (bb == null) return false;
+            double[] v = new double[6];
+            for (int i = 0; i < 6; i++) v[i] = bbAcc[i].getDouble(bb);
+            for (double d : v) if (Double.isNaN(d) || Double.isInfinite(d)) return false;
+            double w = Math.max(v[3] - v[0], v[5] - v[2]), h = v[4] - v[1];
+            if (w < 0.02 || w > 8 || h < 0.02 || h > 8) return false;
+            out[0] = (float) w; out[1] = (float) h;
+            return true;
         }
 
         /** out[0] = yaw, out[1] = pitch (degrees); NaN when unknown. */
@@ -419,27 +447,8 @@ final class Probe {
         }
     }
 
-    private Model buildModel(Class<?> c, List<Object> samples) {
-        // --- candidates for the position
-        List<PosCand> cands = new ArrayList<PosCand>();
-        for (Class<?> k = c; k != null && k != Object.class; k = k.getSuperclass()) {
-            List<Field> doubles = new ArrayList<Field>();
-            for (Field f : k.getDeclaredFields()) {
-                if (Modifier.isStatic(f.getModifiers())) continue;
-                Class<?> t = f.getType();
-                if (t == double.class) doubles.add(f);
-                else if (!t.isPrimitive() && isVec3Like(t)) {
-                    Acc fa = Acc.of(f);
-                    Acc[] va = vecAccessors(t);
-                    if (fa != null && va != null) cands.add(new PosCand(fa, va, true));
-                }
-            }
-            // Older versions (<=1.16) store posX/posY/posZ as plain double fields, grouped in triples.
-            for (int i = 0; i + 2 < doubles.size(); i += 3) {
-                Acc x = Acc.of(doubles.get(i)), y = Acc.of(doubles.get(i + 1)), z = Acc.of(doubles.get(i + 2));
-                if (x != null && y != null && z != null) cands.add(new PosCand(null, new Acc[] {x, y, z}, false));
-            }
-        }
+    Model buildModel(Class<?> c, List<Object> samples) {
+        List<PosCand> cands = posCandidates(c);
         // --- pick by value: biggest magnitude (position >> velocity), summed over all samples
         Model m = new Model();
         double bestScore = 0;
@@ -456,6 +465,7 @@ final class Probe {
             if (ok && score > bestScore) { bestScore = score; m.pos = pc; }
         }
         if (m.pos == null) return null;
+        attachBoundingBox(c, m);
 
         // --- heading: public no-arg method returning a unit-length Vec3-like (the look vector)
         List<Method> good = new ArrayList<Method>();
@@ -529,6 +539,85 @@ final class Probe {
         return d;
     }
 
+    /** Every plausible "position" accessor of a class: Vec3-like fields and (aligned) triples of double fields. */
+    List<PosCand> posCandidates(Class<?> c) {
+        List<PosCand> cands = new ArrayList<PosCand>();
+        for (Class<?> k = c; k != null && k != Object.class; k = k.getSuperclass()) {
+            List<Field> doubles = new ArrayList<Field>();
+            for (Field f : k.getDeclaredFields()) {
+                if (Modifier.isStatic(f.getModifiers())) continue;
+                Class<?> t = f.getType();
+                if (t == double.class) doubles.add(f);
+                else if (!t.isPrimitive() && isVec3Like(t)) {
+                    Acc fa = Acc.of(f);
+                    Acc[] va = vecAccessors(t);
+                    if (fa != null && va != null) cands.add(new PosCand(fa, va, true));
+                }
+            }
+            // Older versions (<=1.16) store posX/posY/posZ as plain double fields, grouped in triples.
+            for (int i = 0; i + 2 < doubles.size(); i += 3) {
+                Acc x = Acc.of(doubles.get(i)), y = Acc.of(doubles.get(i + 1)), z = Acc.of(doubles.get(i + 2));
+                if (x != null && y != null && z != null) cands.add(new PosCand(null, new Acc[] {x, y, z}, false));
+            }
+        }
+        return cands;
+    }
+
+    private final Map<Class<?>, Acc[]> aabbCache = new HashMap<Class<?>, Acc[]>();
+
+    /** Accessors (minX,minY,minZ,maxX,maxY,maxZ) of an AABB-like class (exactly six doubles, nothing else), else null. */
+    Acc[] aabbAccessors(Class<?> t) {
+        if (t.isPrimitive() || t.isArray() || t.isInterface() || isJdkish(t)) return null;
+        if (aabbCache.containsKey(t)) return aabbCache.get(t);
+        Acc[] out = null;
+        try {
+            List<Acc> l = new ArrayList<Acc>();
+            int other = 0;
+            for (Class<?> k = t; k != null && k != Object.class; k = k.getSuperclass())
+                for (Field f : k.getDeclaredFields()) {
+                    if (Modifier.isStatic(f.getModifiers())) continue;
+                    if (f.getType() == double.class) { Acc a = Acc.of(f); if (a != null) l.add(a); } else other++;
+                }
+            if (other == 0 && l.size() == 6) out = l.toArray(new Acc[0]);
+        } catch (Throwable ignored) { }
+        aabbCache.put(t, out);
+        return out;
+    }
+
+    /** First field of the entity class hierarchy whose type is AABB-like (the bounding box). */
+    private void attachBoundingBox(Class<?> c, Model m) {
+        for (Class<?> k = c; k != null && k != Object.class; k = k.getSuperclass())
+            for (Field f : k.getDeclaredFields()) {
+                if (Modifier.isStatic(f.getModifiers()) || f.getType().isPrimitive()) continue;
+                Acc[] bb = aabbAccessors(f.getType());
+                Acc fa = bb == null ? null : Acc.of(f);
+                if (fa != null) { m.bbField = fa; m.bbAcc = bb; return; }
+            }
+    }
+
+    private Method gpIdMethod;
+
+    /** UUID string of a player's GameProfile ("-" if unknown). */
+    String uuidOf(Object player) {
+        try {
+            Class<?> c = player.getClass();
+            Acc pf = profileFieldCache.get(c);
+            if (pf == null) { nameOf(player); pf = profileFieldCache.get(c); }
+            if (pf == null) return "-";
+            Object gp = pf.getObj(player);
+            if (gp == null) return "-";
+            if (gpIdMethod == null) {
+                for (String n : new String[] {"getId", "id"}) {
+                    try { Method m = gameProfile.getMethod(n); if (m.getReturnType() == java.util.UUID.class) { gpIdMethod = m; break; } }
+                    catch (Throwable ignored) { }
+                }
+            }
+            if (gpIdMethod == null) return "-";
+            Object u = gpIdMethod.invoke(gp);
+            return u == null ? "-" : u.toString();
+        } catch (Throwable t) { return "-"; }
+    }
+
     // ------------------------------------------------------------------ per-tick read
 
     Snapshot read() {
@@ -574,11 +663,14 @@ final class Probe {
 
         double[] p3 = new double[3];
         float[] o2 = new float[2];
+        float[] sz2 = new float[2];
         if (localObj != null) {
             Model m = models.get(localObj.getClass());
             if (m != null && m.position(localObj, p3)) {
                 m.orient(localObj, o2);
-                s.local = new Snapshot.Rec(localName, p3[0], p3[1], p3[2], o2[0], o2[1], m.health(localObj));
+                boolean hasSz = m.size(localObj, sz2);
+                s.local = new Snapshot.Rec(localName, p3[0], p3[1], p3[2], o2[0], o2[1], m.health(localObj),
+                        hasSz ? sz2[0] : Float.NaN, hasSz ? sz2[1] : Float.NaN, uuidOf(localObj));
             }
         }
         for (Object p : players) {
@@ -588,11 +680,49 @@ final class Probe {
             Model m = models.get(p.getClass());
             if (m == null || !m.position(p, p3)) continue;
             m.orient(p, o2);
-            s.players.add(new Snapshot.Rec(nm, p3[0], p3[1], p3[2], o2[0], o2[1], m.health(p)));
+            boolean hasSz = m.size(p, sz2);
+            s.players.add(new Snapshot.Rec(nm, p3[0], p3[1], p3[2], o2[0], o2[1], m.health(p),
+                    hasSz ? sz2[0] : Float.NaN, hasSz ? sz2[1] : Float.NaN, uuidOf(p)));
+        }
+        if (s.local != null && !Float.isNaN(s.local.yaw) && !Float.isNaN(s.local.pitch)) {
+            double[] eye = {s.local.x, s.local.y + 1.62, s.local.z};
+            ensureAux();
+            camScan.observe(eye, s.local.yaw, s.local.pitch);
+            s.camera = camScan.read(eye, s.local.yaw);
+            if (now - lastItemPoll >= 100) {                          // items change slowly: 10 Hz is plenty
+                lastItemPoll = now;
+                lastItems = itemScan.poll(eye, 48);
+            }
+            s.items.addAll(lastItems);
+            if (!camScan.describe.equals(exportedCam) || !itemScan.describe.equals(exportedItems)) {
+                exportedCam = camScan.describe; exportedItems = itemScan.describe;
+                exportLayout();
+            }
         }
         s.status = s.local == null ? "connected, but local player not found (set user=NAME?)"
-                                   : "agent ok: " + s.players.size() + " other player(s)";
+                                   : "agent ok: " + s.players.size() + " player(s), " + s.items.size() + " item(s)"
+                                     + (s.camera == null ? ", camera: reconstructing" : (Float.isNaN(s.camera.fov) ? ", camera: exact, FOV: configured" : ", camera+FOV: exact"));
         return s;
+    }
+
+    /** Runs the second graph search (camera candidates + entity containers) once per discovery. */
+    private void ensureAux() {
+        if (auxDone) return;
+        long now = System.currentTimeMillis();
+        if (now < auxNextTry) return;
+        try {
+            Acc rootStep = containerPath.steps[0];
+            Object root = rootStep.getObj(null);
+            if (root == null) { auxNextTry = now + 3000; return; }
+            aux.search(root, rootStep, 6, 120000, 3000);
+            camScan.init(aux.cameraCands);
+            itemScan.setContainers(aux.entityContainers);
+            auxDone = true;
+            Log.info("Aux search: " + aux.cameraCands.size() + " camera candidate(s), " + aux.entityContainers.size() + " entity container(s).");
+        } catch (Throwable t) {
+            Log.info("Aux search failed: " + t);
+            auxNextTry = now + 10000;
+        }
     }
 
     private static void addSample(Map<Class<?>, List<Object>> m, Object p) {
@@ -643,6 +773,8 @@ final class Probe {
              .append(",\n  \"gameProfileClass\": ").append(esc(gameProfile == null ? null : gameProfile.getName()))
              .append(",\n  \"playerListPath\": ").append(pathJson(containerPath))
              .append(",\n  \"localPlayerPath\": ").append(pathJson(localPath))
+             .append(",\n  \"camera\": ").append(esc(camScan.describe))
+             .append(",\n  \"items\": ").append(esc(itemScan.describe))
              .append(",\n  \"playerClasses\": [");
             boolean first = true;
             for (Map.Entry<Class<?>, Model> e : models.entrySet()) {

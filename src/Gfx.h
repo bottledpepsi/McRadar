@@ -13,6 +13,7 @@
 // DwmFlush() right after Present() - it blocks until the desktop compositor's next vblank-aligned pass.
 #pragma once
 #include "Platform.h"
+#include "Image.h"
 #include "RaiiHandle.h"
 #ifdef DrawText
 #undef DrawText          // windows.h maps DrawText -> DrawTextA; that would rename ID2D1RenderTarget::DrawText
@@ -20,6 +21,7 @@
 #include <d2d1.h>
 #include <dwrite.h>
 #include <string>
+#include <unordered_map>
 
 struct Col
 {
@@ -56,6 +58,9 @@ public:
     void Circle(float x, float y, float r, Col c, float thick = 1.f);
     void FillCircle(float x, float y, float r, Col c);
     void FillTriangle(float x1, float y1, float x2, float y2, float x3, float y3, Col c);
+    // Draws a premultiplied-BGRA image scaled to (x,y,w,h) with nearest-neighbour filtering (crisp pixel art).
+    // The Direct2D bitmap is created on first use and cached under img.id (dropped if the render target is lost).
+    void DrawImage(const Image& img, float x, float y, float w, float h, float opacity = 1.f);
     void PushClip(float x, float y, float w, float h);
     void PopClip();
 
@@ -77,6 +82,7 @@ private:
     ComPtr<IDWriteFactory> dw_;
     ComPtr<IDWriteTextFormat> fmt_[static_cast<int>(Font::Count)][3]; // [font][0=left 1=center 2=right]
 
+    std::unordered_map<uint64_t, ComPtr<ID2D1Bitmap>> bitmaps_;
     HDC memDc_ = nullptr;
     HBITMAP dib_ = nullptr, oldBmp_ = nullptr;
     int w_ = 0, h_ = 0;

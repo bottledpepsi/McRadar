@@ -53,6 +53,8 @@ struct EspConfig
     bool VSync = true; // pace presentation to the display refresh (DwmFlush)
     bool Smoothing = true; // extrapolate between 20-60 Hz agent updates
     bool ShowHealth = true; // health bar next to the box (when the agent reports health)
+    bool ShowItemEnchants = true; // list enchantments under an item's name
+    bool ShowItemTags = false; // list the stack's raw tags (NBT / components) under the name
 
     std::string ToJson() const;
     static EspConfig FromJson(const json::Object& o); // missing keys keep their defaults
@@ -85,6 +87,7 @@ struct Settings
     // additions
     int fovIdx = 1;
     bool vsync = true, smoothing = true, showHealth = true;
+    bool showItemEnchants = true, showItemTags = false;
 
     void Apply(const EspConfig& c);
     EspConfig Build() const;

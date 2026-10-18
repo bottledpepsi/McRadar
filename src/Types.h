@@ -17,22 +17,46 @@ struct PlayerState
     Vec3 pos; // feet position
     float yawDeg = 0, pitchDeg = 0, health = 0;
     bool yawValid = false, pitchValid = false, healthValid = false;
+    float width = 0.6f, height = 1.8f; // hitbox from the game (sneaking players are shorter)
+    bool sizeValid = false;
     std::string name;
+    std::string uuid; // "" if unknown; online-mode UUIDs are version 4, offline ones version 3
 };
 
-// Dropped item entity. The protocol carries them ("I" lines) but the current agent does not
-// discover item entities yet, so this list stays empty unless an agent version sends them.
+struct Enchant
+{
+    std::string id; // "minecraft:sharpness" (or a legacy numeric id)
+    int level = 1;
+};
+
+// Dropped item entity with its stack contents.
 struct ItemState
 {
     Vec3 pos;
-    std::string name;
+    float width = 0.25f, height = 0.25f;
+    bool sizeValid = false;
     int count = 1;
+    std::string key; // "minecraft:diamond_sword"
+    std::vector<Enchant> enchants;
+    std::string tags; // the stack's NBT / component text (SNBT), may be long
+};
+
+// The game's camera as read by the agent. `fovValid` is false when the FOV method could not be found
+// (the configured FOV is used then). mode: 1 first person, 2 third person (behind), 3 third person (front).
+struct CameraState
+{
+    bool valid = false;
+    Vec3 pos;
+    float yawDeg = 0, pitchDeg = 0, fovDeg = 70;
+    bool fovValid = false;
+    int mode = 1;
 };
 
 struct WorldSnapshot
 {
     bool localValid = false;
     PlayerState local;
+    CameraState camera;
     std::vector<PlayerState> players; // OTHER players only
     std::vector<ItemState> items;
     std::string status; // agent status line

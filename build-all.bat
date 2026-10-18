@@ -28,7 +28,10 @@ echo Using g++ from %GXXDIR%
 
 :have_gxx
 if not exist dist mkdir dist
-g++ -std=c++20 -O2 -Wall -Wextra src\*.cpp -o dist\mcesp.exe -ld2d1 -ldwrite -ldwmapi -lwinmm -lgdi32 -luser32 -lws2_32 -static || exit /b 1
+rem NOTE: no "-static" here: it fails on newer MinGW toolchains (CLion 2026 / GCC 15). libwinpthread-1.dll is copied instead.
+g++ -std=c++20 -O2 -Wall -Wextra src\*.cpp -o dist\mcesp.exe -ld2d1 -ldwrite -ldwmapi -lwinmm -lgdi32 -luser32 -lws2_32 -lwinhttp -lwindowscodecs -lole32 -luuid -static-libgcc -static-libstdc++ || exit /b 1
+for /f "delims=" %%G in ('where g++') do set "GXXEXE=%%G"
+for %%G in ("%GXXEXE%") do if exist "%%~dpGlibwinpthread-1.dll" copy /y "%%~dpGlibwinpthread-1.dll" dist\ >nul
 copy /y agent\esp-agent.jar dist\ >nul
 echo.
 echo Done: %ROOT%\dist\mcesp.exe

@@ -18,11 +18,11 @@ import java.lang.reflect.Field;
  */
 final class Mem {
     static final boolean OK;
-    private static final MethodHandle GET_OBJ, GET_DOUBLE, OBJ_OFF, STATIC_OFF, STATIC_BASE;
+    private static final MethodHandle GET_OBJ, GET_DOUBLE, GET_FLOAT, GET_INT, OBJ_OFF, STATIC_OFF, STATIC_BASE;
 
     static {
         boolean ok = false;
-        MethodHandle a = null, b = null, c = null, d = null, e = null;
+        MethodHandle a = null, b = null, c = null, d = null, e = null, g = null, h = null;
         try {
             Class<?> uc = Class.forName("sun.misc.Unsafe");
             Field f = uc.getDeclaredField("theUnsafe");
@@ -31,6 +31,8 @@ final class Mem {
             MethodHandles.Lookup l = MethodHandles.publicLookup();
             a = l.findVirtual(uc, "getObject", MethodType.methodType(Object.class, Object.class, long.class)).bindTo(u);
             b = l.findVirtual(uc, "getDouble", MethodType.methodType(double.class, Object.class, long.class)).bindTo(u);
+            g = l.findVirtual(uc, "getFloat", MethodType.methodType(float.class, Object.class, long.class)).bindTo(u);
+            h = l.findVirtual(uc, "getInt", MethodType.methodType(int.class, Object.class, long.class)).bindTo(u);
             c = l.findVirtual(uc, "objectFieldOffset", MethodType.methodType(long.class, Field.class)).bindTo(u);
             d = l.findVirtual(uc, "staticFieldOffset", MethodType.methodType(long.class, Field.class)).bindTo(u);
             e = l.findVirtual(uc, "staticFieldBase", MethodType.methodType(Object.class, Field.class)).bindTo(u);
@@ -38,7 +40,7 @@ final class Mem {
         } catch (Throwable t) {
             Log.info("Unsafe unavailable (" + t + "); falling back to reflection for instance fields only.");
         }
-        OK = ok; GET_OBJ = a; GET_DOUBLE = b; OBJ_OFF = c; STATIC_OFF = d; STATIC_BASE = e;
+        OK = ok; GET_OBJ = a; GET_DOUBLE = b; GET_FLOAT = g; GET_INT = h; OBJ_OFF = c; STATIC_OFF = d; STATIC_BASE = e;
     }
 
     static Object getObject(Object base, long off) {
@@ -47,6 +49,14 @@ final class Mem {
     }
     static double getDouble(Object base, long off) {
         try { return (double) GET_DOUBLE.invokeExact(base, off); }
+        catch (Throwable t) { throw new IllegalStateException(t); }
+    }
+    static float getFloat(Object base, long off) {
+        try { return (float) GET_FLOAT.invokeExact(base, off); }
+        catch (Throwable t) { throw new IllegalStateException(t); }
+    }
+    static int getInt(Object base, long off) {
+        try { return (int) GET_INT.invokeExact(base, off); }
         catch (Throwable t) { throw new IllegalStateException(t); }
     }
     static long objectFieldOffset(Field f) {
