@@ -68,7 +68,7 @@ namespace presets
                     "Tall Grass", "Seeds", "Wheat Seeds", "Beetroot Seeds", "Kelp", "Seagrass", "Vines", "Sugar Cane",
                     "Bamboo", "Cactus",
                     "Lily Pad", "Azalea", "Flowering Azalea", "Azalea Leaves", "Flowering Azalea Leaves", "Moss Block",
-                    "Moss Carpet",
+                    "Moss Carpet", "Leaf Litter",
                     "Hanging Roots", "Rooted Dirt", "Small Dripleaf", "Big Dripleaf", "Spore Blossom", "Bowl",
                     "Glass Bottle", "Paper",
                     "Book", "Flint", "Clay Ball", "Charcoal", "Snowball", "Egg"
