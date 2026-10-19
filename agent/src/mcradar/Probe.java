@@ -53,6 +53,20 @@ final class Probe {
     final Map<Class<?>, Model> models = new HashMap<Class<?>, Model>();
     private final Map<Class<?>, Long> lastModelAttempt = new HashMap<Class<?>, Long>();
     private long lastModelRebuild;
+    // At pitch exactly +-90 the look vector has no horizontal part, so yaw cannot be derived from it. Keep the last
+    // yaw seen per player object (cleared when it grows) and use it only for that degenerate case.
+    private final IdentityHashMap<Object, Float> lastYaw = new IdentityHashMap<Object, Float>();
+    private boolean localYawFresh;
+
+    private void holdYaw(Object o, float[] o2) {
+        if (!Float.isNaN(o2[0])) {
+            if (lastYaw.size() > 512) lastYaw.clear();
+            lastYaw.put(o, o2[0]);
+        } else if (!Float.isNaN(o2[1])) {          // pitch known, yaw not: straight up/down
+            Float y = lastYaw.get(o);
+            if (y != null) o2[0] = y;
+        }
+    }
 
     FieldPath containerPath;
     private FieldPath localPath;
@@ -722,6 +736,8 @@ final class Probe {
             Model m = models.get(localObj.getClass());
             if (m != null && m.position(localObj, p3)) {
                 m.orient(localObj, o2);
+                localYawFresh = !Float.isNaN(o2[0]);
+                holdYaw(localObj, o2);
                 boolean hasSz = m.size(localObj, sz2);
                 s.local = new Snapshot.Rec(localName, p3[0], p3[1], p3[2], o2[0], o2[1], m.health(localObj),
                         hasSz ? sz2[0] : Float.NaN, hasSz ? sz2[1] : Float.NaN, uuidOf(localObj));
@@ -734,14 +750,15 @@ final class Probe {
             Model m = models.get(p.getClass());
             if (m == null || !m.position(p, p3)) continue;
             m.orient(p, o2);
+            holdYaw(p, o2);
             boolean hasSz = m.size(p, sz2);
             s.players.add(new Snapshot.Rec(nm, p3[0], p3[1], p3[2], o2[0], o2[1], m.health(p),
                     hasSz ? sz2[0] : Float.NaN, hasSz ? sz2[1] : Float.NaN, uuidOf(p)));
         }
-        if (s.local != null && !Float.isNaN(s.local.yaw) && !Float.isNaN(s.local.pitch)) {
+        if (s.local != null && !Float.isNaN(s.local.pitch)) {      // yaw may be NaN only when looking straight up/down with no yaw seen yet
             double[] eye = {s.local.x, s.local.y + 1.62, s.local.z};
             ensureAux();
-            camScan.observe(eye, s.local.yaw, s.local.pitch);
+            if (localYawFresh) camScan.observe(eye, s.local.yaw, s.local.pitch);   // never learn from a held (stale) yaw
             s.camera = camScan.read(eye, s.local.yaw);
             if (now - lastItemPoll >= 100) {                          // items change slowly: 10 Hz is plenty
                 lastItemPoll = now;

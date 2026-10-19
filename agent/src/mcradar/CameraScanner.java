@@ -202,7 +202,7 @@ final class CameraScanner {
                 if (Float.isNaN(fov) && System.currentTimeMillis() - lastFovAt < 2000) fov = lastFov;   // brief glitches (chunk race)
             }
             double dist = Math.sqrt((v[0] - eye[0]) * (v[0] - eye[0]) + (v[1] - eye[1]) * (v[1] - eye[1]) + (v[2] - eye[2]) * (v[2] - eye[2]));
-            int mode = dist < 0.8 ? 1 : (angDiff(yaw, playerYaw) > 90 ? 3 : 2);
+            int mode = dist < 0.8 ? 1 : (!Float.isNaN(playerYaw) && angDiff(yaw, playerYaw) > 90 ? 3 : 2);
             return new Snapshot.Cam(v[0], v[1], v[2], yaw, pitch, fov, mode);
         } catch (Throwable t) { return null; }
     }
