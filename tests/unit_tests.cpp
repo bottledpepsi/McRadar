@@ -1,5 +1,6 @@
 #include <cstring>
 #include "Camera.h"
+#include "ScreenBox.h"
 #include "ItemText.h"
 #include "EspConfig.h"
 #include "FriendList.h"
@@ -169,6 +170,29 @@ int main() {
         CHECK(near(pr2.camera.pos.x, 1.0) && near(pr2.camera.yawDeg, -177, 1e-2));
         b.camera.mode = 2; Smoother sm3; sm3.Push(a); sm3.Push(b);
         CHECK(near(sm3.Predict(b.arrived + std::chrono::milliseconds(50), true).camera.pos.x, 0.5));
+    }
+
+
+    // --- Distant items must not vanish: a 0.25-block item at 100 blocks is ~2 px at screen centre -------------
+    {
+        Camera cc; cc.eye = {0, 1.62, 0}; cc.yawDeg = 0; cc.pitchDeg = 0; cc.fovYDeg = 70; cc.w = 1920; cc.h = 1080; cc.Update();
+        ScreenBox sb;
+        // raw size straight ahead at 100 blocks is below the old 2 px cull -> this is what used to hide the item
+        ScreenBox raw;
+        CHECK(ProjectBox(cc, {0, 1.62, 100}, 0.25, 0.25, 0.f, raw) && (raw.x1 - raw.x0) < 2.f);
+        // now: still drawn, at the minimum marker size, centred on the item
+        CHECK(ProjectBox(cc, {0, 1.62, 100}, 0.25, 0.25, 6.f, sb));
+        CHECK(near(sb.x1 - sb.x0, 6.0, 1e-3) && near(sb.y1 - sb.y0, 6.0, 1e-3) && near((sb.x0 + sb.x1) * 0.5, 960, 1.0));
+        // same at 300 blocks, and far off to one side (inside the view)
+        CHECK(ProjectBox(cc, {0, 1.62, 300}, 0.25, 0.25, 6.f, sb));
+        CHECK(ProjectBox(cc, {-120, 1.62, 100}, 0.25, 0.25, 6.f, sb));
+        // near items keep their true (larger) size
+        CHECK(ProjectBox(cc, {0, 1.62, 3}, 0.25, 0.25, 6.f, sb) && (sb.x1 - sb.x0) > 20.f);
+        // behind the camera / outside the view are still rejected
+        CHECK(!ProjectBox(cc, {0, 1.62, -20}, 0.25, 0.25, 6.f, sb));
+        CHECK(!ProjectBox(cc, {500, 1.62, 10}, 0.25, 0.25, 6.f, sb));
+        // consistency: an item is visible when looked at directly AND when it is near the edge of the view
+        CHECK(ProjectBox(cc, {0, 1.62, 90}, 0.25, 0.25, 6.f, sb) && ProjectBox(cc, {-55, 1.62, 90}, 0.25, 0.25, 6.f, sb));
     }
 
     std::printf(fails ? "\n%d FAILURES\n" : "\nALL OK\n", fails);

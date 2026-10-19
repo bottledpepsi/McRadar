@@ -75,6 +75,49 @@ final class Probe {
     }
 
     boolean isReady() { return ready; }
+
+    private final Map<Class<?>, Boolean> entityClassCache = new HashMap<Class<?>, Boolean>();
+
+    /** True for entity-like classes (have a position). Cached. Used to avoid walking from a stack back into the world. */
+    boolean isEntityClass(Class<?> c) {
+        Boolean b = entityClassCache.get(c);
+        if (b == null) {
+            boolean r = false;
+            try { r = !c.isPrimitive() && !c.isArray() && !c.isInterface() && !isJdkish(c) && !posCandidates(c).isEmpty(); } catch (Throwable ignored) { }
+            entityClassCache.put(c, r);
+            b = r;
+        }
+        return b;
+    }
+
+    File exportDirFile() { return new File(cfg.exportDir); }
+
+    private Set<Class<?>> worldClasses;
+
+    /** True for the world object (the class hierarchy of the object that owns the player list, e.g. ClientLevel/Level). */
+    boolean isWorldClass(Class<?> c) {
+        if (worldClasses == null) {
+            Set<Class<?>> s = new HashSet<Class<?>>();
+            Node h = holderNode();
+            if (h != null)
+                for (Class<?> k = h.obj.getClass(); k != null && k != Object.class && !isJdkish(k); k = k.getSuperclass()) s.add(k);
+            worldClasses = s;
+        }
+        return worldClasses.contains(c);
+    }
+
+    /** Node of the object that owns the player container (normally the ClientLevel), or null. */
+    Node holderNode() {
+        if (containerPath == null) return null;
+        Acc[] st = containerPath.steps;
+        Node prev = null; Object cur = null;
+        for (int i = 0; i < st.length - 1; i++) {
+            cur = st[i].getObj(i == 0 ? null : cur);
+            if (cur == null) return null;
+            prev = new Node(cur, prev, st[i], i + 1);
+        }
+        return prev;
+    }
     String status() { return status; }
     void reset() { ready = false; failTicks = 0; }
 
@@ -220,6 +263,16 @@ final class Probe {
         return null;
     }
 
+    /** elements() with retries: the game thread mutates these maps while we copy them (CME / torn reads). */
+    static Object[] elementsRetry(Object o) {
+        for (int i = 0; i < 5; i++) {
+            Object[] el = elements(o);
+            if (el != null) return el;
+            try { Thread.sleep(1); } catch (InterruptedException ignored) { }
+        }
+        return null;
+    }
+
     // ------------------------------------------------------------------ player name
 
     String nameOf(Object player) {
@@ -352,6 +405,7 @@ final class Probe {
         for (Cand c : s.containers)
             if (c.depth < best.depth || (c.depth == best.depth && c.count > best.count)) best = c;
         containerPath = pathOf(best.parent, best.via);
+        worldClasses = null;
 
         Node localNode = null;
         for (Node n : s.locals) {
@@ -691,7 +745,8 @@ final class Probe {
             s.camera = camScan.read(eye, s.local.yaw);
             if (now - lastItemPoll >= 100) {                          // items change slowly: 10 Hz is plenty
                 lastItemPoll = now;
-                lastItems = itemScan.poll(eye, 48);
+                List<Snapshot.Item> polled = itemScan.poll(eye, 48);
+                if (polled != null) lastItems = polled;                 // null = transient read failure: keep the last frame
             }
             s.items.addAll(lastItems);
             if (!camScan.describe.equals(exportedCam) || !itemScan.describe.equals(exportedItems)) {
@@ -700,7 +755,7 @@ final class Probe {
             }
         }
         s.status = s.local == null ? "connected, but local player not found (set user=NAME?)"
-                                   : "agent ok: " + s.players.size() + " player(s), " + s.items.size() + " item(s)"
+                                   : "agent ok: " + s.players.size() + " player(s), " + s.items.size() + " item(s) [" + itemScan.summary() + "]"
                                      + (s.camera == null ? ", camera: reconstructing" : (Float.isNaN(s.camera.fov) ? ", camera: exact, FOV: configured" : ", camera+FOV: exact"));
         return s;
     }
@@ -715,6 +770,9 @@ final class Probe {
             Object root = rootStep.getObj(null);
             if (root == null) { auxNextTry = now + 3000; return; }
             aux.search(root, rootStep, 6, 120000, 3000);
+            // The level can be buried deep below a huge root graph; search again from the level itself.
+            Node holder = holderNode();
+            if (holder != null) aux.searchEntitiesFrom(holder, 5, 60000, 2500);
             camScan.init(aux.cameraCands);
             itemScan.setContainers(aux.entityContainers);
             auxDone = true;

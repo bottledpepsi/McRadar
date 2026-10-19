@@ -97,4 +97,42 @@ final class AuxSearch {
             }
         }
     }
+
+    /**
+     * Entity-container search rooted at an inner object (the level that owns the player list), with its own budget.
+     * Adds containers not already known (deduplicated by container identity).
+     */
+    void searchEntitiesFrom(Probe.Node start, int maxDepth, int maxNodes, long budgetMs) {
+        final long deadline = System.currentTimeMillis() + budgetMs;
+        IdentityHashMap<Object, Boolean> known = new IdentityHashMap<Object, Boolean>();
+        for (FieldPath fp : entityContainers) { Object c = fp.follow(); if (c != null) known.put(c, Boolean.TRUE); }
+        IdentityHashMap<Object, Boolean> seen = new IdentityHashMap<Object, Boolean>();
+        ArrayDeque<Probe.Node> q = new ArrayDeque<Probe.Node>();
+        seen.put(start.obj, Boolean.TRUE);
+        q.add(start);
+        int added = 0;
+        while (!q.isEmpty() && seen.size() < maxNodes && System.currentTimeMillis() < deadline) {
+            Probe.Node n = q.poll();
+            for (Acc a : p.refFieldsOf(n.obj.getClass())) {
+                Object v = a.getObj(n.obj);
+                if (v == null) continue;
+                if (Probe.isContainer(v)) {
+                    if (seen.put(v, Boolean.TRUE) != null) continue;
+                    Object[] el = Probe.elements(v);
+                    boolean entities = declaredEntityElements(a.f);
+                    if (!entities && el != null) {
+                        int n2 = 0;
+                        for (Object e : el) { if (e != null && isEntityLike(e.getClass())) { entities = true; break; } if (++n2 > 64) break; }
+                    }
+                    if (entities && !known.containsKey(v)) { entityContainers.add(Probe.pathOf(n, a)); known.put(v, Boolean.TRUE); added++; }
+                    continue;
+                }
+                Class<?> c = v.getClass();
+                if (Probe.isJdkish(c) || p.isPlayerClass(c) || seen.put(v, Boolean.TRUE) != null) continue;
+                if (isEntityLike(c)) continue;
+                if (n.depth < maxDepth) q.add(new Probe.Node(v, n, a, n.depth + 1));
+            }
+        }
+        Log.info("Level-rooted entity search: " + seen.size() + " object(s) visited, " + added + " new container(s).");
+    }
 }

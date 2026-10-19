@@ -42,8 +42,10 @@ Hotkeys (rebindable): **Insert** config · **Delete** toggle ESP · **hold End 3
 Opening the config removes click-through and takes keyboard focus; closing it (or clicking back into the game) restores both.
 
 ## The three data sources
-**Items (agent).** Item entities are found without any Minecraft name: an *ItemStack* is a small class with an `int` in 1..99 (count) and a public no-arg `String` method returning a translation key
-(`item.minecraft.diamond_sword`, legacy `item.diamondSword`); an *item entity* is a positioned entity holding such a stack with a ~0.25-block hitbox (item frames/arrows are filtered by size).
+**Items (agent).** Item entities are found without any Minecraft name. An *ItemStack* is a small class with an `int` (the count; `0` = empty stack) and a resolvable item id: a public no-arg `String` method returning a translation key
+(`item.minecraft.diamond_sword`, legacy `item.diamondSword`), or - if the stack has no such method - the id from its item reference (an Item object with that method, or a registry holder printing `ResourceKey[minecraft:item / minecraft:diamond_sword]`).
+An *item entity* is a positioned entity from which a non-empty stack is **reachable through a short path of small objects**: in real Minecraft the `ItemEntity` has no stack field, the stack sits in `entityData -> DataItem[] -> value`
+(next to `initialValue`, which holds the empty stack), so the path is found by a bounded graph search per entity class and replayed per entity. A ~0.25-block hitbox filters item frames/arrows.
 They are read from the level's entity storage (found by generic element type / runtime elements). Per item the agent sends position, hitbox, count, id, enchantments and the tag text:
 up to 1.20.4 the stack's NBT prints itself as SNBT (`{Enchantments:[{id:"minecraft:sharpness",lvl:5s}]}`) and enchantments are parsed from it; from 1.20.5 the component graph is searched for
 `Map<Holder,Integer>` enchantment maps. The nearest 48 items are sent; labels show `Name xN`, the enchantments (curses red) and optionally the raw tags (ITEMS tab).
@@ -89,6 +91,7 @@ Tabs: GENERAL · PLAYERS (+friends) · TRACERS · ITEMS · MINIMAP · PROFILES �
 | `SkinCache: GET ... WinHTTP error 12029/12007` | no network / blocked; set `ESP_*` mirrors or accept placeholders |
 | `Cannot listen on 127.0.0.1:47615` | another instance is running; use `--port` |
 | `agent jar not found` | run `agent\build.bat`; keep `esp-agent.jar` next to `mcesp.exe` |
+| `agent ok: ... 0 item(s) [items A/B ent]` | `B` = entities the agent can see, `A` = how many were recognised as item entities. `B = 0`: entity container not found (see `esp_agent.log`, "Entity container"). `B > 0, A = 0`: open `esp_items_debug.txt` (written ~5-35 s after the problem starts, next to `esp_layout.json`) - it lists each entity class, what is reachable from it and where the search stopped. Send that file + `esp_agent.log`. |
 
 ## Layout
 `src/` C++ (Logger, Json, Presets, EspConfig, FriendList, ProfileManager, Wire, ItemText, Camera, Smoother, ProcessManager, AgentInjector, AgentSupervisor, UdpListener, SkinCache, Gfx, EspRenderer, ConfigUi, EspOverlay, main) ·

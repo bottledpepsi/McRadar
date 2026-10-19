@@ -3,6 +3,7 @@
 #include "FriendList.h"
 #include "ItemText.h"
 #include "Presets.h"
+#include "ScreenBox.h"
 #include "SkinCache.h"
 #include <algorithm>
 #include <cmath>
@@ -232,25 +233,9 @@ void EspRenderer::DrawPlayer(Gfx& g, const Settings& s, const Camera& cam, const
 void EspRenderer::DrawItem(Gfx& g, const Settings& s, const Camera& cam, const ItemState& it, float dist)
 {
     const double iw = it.sizeValid ? it.width : 0.25, ih = it.sizeValid ? it.height : 0.25;
-    float cx, cy;
-    if (!cam.Project({it.pos.x, it.pos.y + ih * 0.5, it.pos.z}, cx, cy)) return;
-    float minX = 1e9f, minY = 1e9f, maxX = -1e9f, maxY = -1e9f;
-    for (int xi = 0; xi < 2; ++xi)
-        for (int yi = 0; yi < 2; ++yi)
-            for (int zi = 0; zi < 2; ++zi)
-            {
-                float sx, sy;
-                cam.ProjectClamped({
-                                       it.pos.x + (xi ? iw * 0.5 : -iw * 0.5), it.pos.y + (yi ? ih : 0.0),
-                                       it.pos.z + (zi ? iw * 0.5 : -iw * 0.5)
-                                   }, sx, sy);
-                minX = std::min(minX, sx);
-                maxX = std::max(maxX, sx);
-                minY = std::min(minY, sy);
-                maxY = std::max(maxY, sy);
-            }
-    if (maxX - minX < 2.f || maxY - minY < 2.f) return;
-    if (maxX < 0 || minX > cam.w || maxY < 0 || minY > cam.h) return;
+    ScreenBox sb;
+    if (!ProjectBox(cam, it.pos, iw, ih, 6.f, sb)) return; // small distant items are kept at a 6 px marker
+    const float minX = sb.x0, minY = sb.y0, maxX = sb.x1, maxY = sb.y1;
     const float op = presets::TraceOpacities[s.itemOpacityIdx];
     const bool enchanted = !it.enchants.empty();
     const Col boxCol = enchanted ? Col{0.62f, 0.78f, 1.f, op} : Col{1, 1, 1, op};

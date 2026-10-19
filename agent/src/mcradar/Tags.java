@@ -91,6 +91,7 @@ final class Tags {
                 return;
             }
             if (Probe.isJdkish(c)) return;
+            if (p.isEntityClass(c)) return;           // a stack can point back at its entity -> never wander into the world
             for (Acc a : p.refFieldsOf(c)) search(p, a.getObj(o), depth + 1, budget, seen, out);
         } catch (Throwable ignored) { }
     }
