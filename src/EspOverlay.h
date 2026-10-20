@@ -51,12 +51,14 @@ private:
     AgentInjector injector_;
     AgentSupervisor sup_;
     Smoother smoother_;
+    WorldSnapshot snap_; // reused every frame (see Smoother::PredictInto)
     DemoSource demo_;
 
     HWND hwnd_ = nullptr;
     bool shown_ = false, clickThrough_ = true;
     bool visible_ = true; // ESP drawing on/off (toggle hotkey)
     bool configOpen_ = false, quit_ = false, openedAtStart_ = false;
+    bool suppressQuit_ = false; // set while the overlay window is deliberately destroyed and recreated (renderer fallback)
     Clock::time_point configOpenedAt_{};
     Clock::time_point exitHoldStart_{};
     bool exitHolding_ = false;
@@ -73,4 +75,5 @@ private:
     Clock::time_point fpsWindowStart_{};
     int fpsFrames_ = 0;
     float fps_ = 0;
+    float cpuAccumMs_ = 0, cpuMs_ = 0; // CPU time per frame excluding the wait for the compositor
 };

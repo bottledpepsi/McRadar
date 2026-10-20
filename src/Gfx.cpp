@@ -1,6 +1,7 @@
 #include "Gfx.h"
 #include "Logger.h"
 #include <algorithm>
+#include <cfloat>
 
 namespace
 {
@@ -32,6 +33,10 @@ namespace
         {10.f, DWRITE_FONT_WEIGHT_NORMAL}, // Hint
     };
 
+    // Entries per text-cache map before it is flushed (labels repeat frame to frame, so hits dominate).
+    constexpr size_t kLayoutCacheMax = 384;
+    constexpr size_t kWidthCacheMax = 768;
+
     // First installed family from a preference list (Segoe UI is missing on some stripped-down Windows
     // installs and under Wine). Returns the last candidate if none is found.
     std::wstring PickFamily(IDWriteFactory* dw)
@@ -49,18 +54,54 @@ namespace
         }
         return kCandidates[0];
     }
+
+#ifdef ESP_GPU_GFX
+    using DCompCreateFn = HRESULT (WINAPI*)(IDXGIDevice*, REFIID, void**);
+    using D3DCreateFn = HRESULT (WINAPI*)(IDXGIAdapter*, D3D_DRIVER_TYPE, HMODULE, UINT, const D3D_FEATURE_LEVEL*,
+                                          UINT, UINT, ID3D11Device**, D3D_FEATURE_LEVEL*, ID3D11DeviceContext**);
+    constexpr UINT kSwapFlags = DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
+#endif
 } // namespace
 
-Gfx::~Gfx() { FreeSurface(); }
-
-bool Gfx::Init()
+Gfx::~Gfx()
 {
-    HRESULT hr = D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, __uuidof(ID2D1Factory), nullptr,
-                                   reinterpret_cast<void**>(factory_.put()));
-    if (FAILED(hr))
+#ifdef ESP_GPU_GFX
+    ReleaseGpu();
+#endif
+    FreeSurface();
+}
+
+ID2D1Factory* Gfx::Fac() const
+{
+#ifdef ESP_GPU_GFX
+    if (factory1_) return factory1_.get();
+#endif
+    return factory_.get();
+}
+
+bool Gfx::Init(bool allowGpu)
+{
+    HRESULT hr = E_FAIL;
+#ifdef ESP_GPU_GFX
+    if (allowGpu)
     {
-        LOG_ERROR("D2D1CreateFactory failed (0x%08lX)", static_cast<unsigned long>(hr));
-        return false;
+        hr = D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, __uuidof(ID2D1Factory1), nullptr,
+                               reinterpret_cast<void**>(factory1_.put()));
+        if (FAILED(hr)) LOG_WARN("ID2D1Factory1 unavailable (0x%08lX) - using the legacy renderer.",
+                                 static_cast<unsigned long>(hr));
+    }
+#else
+    (void)allowGpu;
+#endif
+    if (!Fac())
+    {
+        hr = D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, __uuidof(ID2D1Factory), nullptr,
+                               reinterpret_cast<void**>(factory_.put()));
+        if (FAILED(hr))
+        {
+            LOG_ERROR("D2D1CreateFactory failed (0x%08lX)", static_cast<unsigned long>(hr));
+            return false;
+        }
     }
     hr = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED, __uuidof(IDWriteFactory),
                              reinterpret_cast<IUnknown**>(dw_.put()));
@@ -72,7 +113,7 @@ bool Gfx::Init()
 
     const std::wstring family = PickFamily(dw_.get());
     LOG_INFO("UI font family: %ls", family.c_str());
-    for (int f = 0; f < static_cast<int>(Font::Count); ++f)
+    for (int f = 0; f < kFontCount; ++f)
     {
         for (int a = 0; a < 3; ++a)
         {
@@ -91,14 +132,40 @@ bool Gfx::Init()
             fmt_[f][a]->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
         }
     }
+
+#ifdef ESP_GPU_GFX
+    if (factory1_)
+    {
+        gpu_ = InitGpu();
+        if (!gpu_)
+        {
+            LOG_WARN("GPU overlay backend unavailable - using the legacy GDI/layered-window renderer.");
+            ReleaseGpu();
+        }
+    }
+#endif
+    if (gpu_) return true;
     return CreateRenderTarget();
 }
+
+bool Gfx::ForceLegacy()
+{
+#ifdef ESP_GPU_GFX
+    ReleaseGpu();
+#endif
+    gpu_ = false;
+    w_ = h_ = 0;
+    return CreateRenderTarget();
+}
+
+// ------------------------------------------------------------------------------------------ legacy backend
 
 bool Gfx::CreateRenderTarget()
 {
     bitmaps_.clear(); // device resources belong to the old render target
     brush_.reset();
-    rt_.reset();
+    dcrt_.reset();
+    rt_ = nullptr;
     D2D1_RENDER_TARGET_PROPERTIES p{};
     p.type = D2D1_RENDER_TARGET_TYPE_DEFAULT;
     p.pixelFormat = D2D1_PIXEL_FORMAT{DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED}; // per-pixel alpha
@@ -106,12 +173,13 @@ bool Gfx::CreateRenderTarget()
     p.dpiY = 96.f;
     p.usage = D2D1_RENDER_TARGET_USAGE_NONE;
     p.minLevel = D2D1_FEATURE_LEVEL_DEFAULT;
-    HRESULT hr = factory_->CreateDCRenderTarget(&p, rt_.put());
+    HRESULT hr = Fac()->CreateDCRenderTarget(&p, dcrt_.put());
     if (FAILED(hr))
     {
         LOG_ERROR("CreateDCRenderTarget failed (0x%08lX)", static_cast<unsigned long>(hr));
         return false;
     }
+    rt_ = dcrt_.get();
     // Grayscale AA: ClearType needs an opaque background, which a transparent overlay does not have.
     rt_->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
     D2D1_COLOR_F white{1, 1, 1, 1};
@@ -135,7 +203,10 @@ void Gfx::FreeSurface()
 bool Gfx::Resize(int w, int h)
 {
     if (w <= 0 || h <= 0) return false;
-    if (w == w_ && h == h_ && dib_ && rt_) return true;
+#ifdef ESP_GPU_GFX
+    if (gpu_) return ResizeGpu(w, h);
+#endif
+    if (w == w_ && h == h_ && dib_ && dcrt_) return true;
     FreeSurface();
     ScreenDC screen;
     memDc_ = CreateCompatibleDC(screen.get());
@@ -157,15 +228,297 @@ bool Gfx::Resize(int w, int h)
     oldBmp_ = static_cast<HBITMAP>(SelectObject(memDc_, dib_));
     w_ = w;
     h_ = h;
-    if (!rt_ && !CreateRenderTarget()) return false;
-    LOG_INFO("Overlay surface %dx%d", w, h);
+    if (!dcrt_ && !CreateRenderTarget()) return false;
+    LOG_INFO("Overlay surface %dx%d (legacy)", w, h);
     return true;
 }
 
+// ------------------------------------------------------------------------------------------ GPU backend
+
+#ifdef ESP_GPU_GFX
+
+void Gfx::ReleaseGpu()
+{
+    // Order matters: everything that references the device goes first.
+    if (dc_) dc_->SetTarget(nullptr);
+    bitmaps_.clear();
+    brush_.reset();
+    rt_ = nullptr;
+    target_.reset();
+    dc_.reset();
+    d2dDev_.reset();
+    dcompVisual_.reset();
+    dcompTarget_.reset();
+    dcompDev_.reset();
+    latencyWait_.reset();
+    swap_.reset();
+    dxgiFac_.reset();
+    dxgiDev_.reset();
+    d3d_.reset();
+    layerOn_ = false;
+    winX_ = winY_ = -32768;
+    winW_ = winH_ = -1;
+}
+
+bool Gfx::InitGpu()
+{
+    if (!dcompCreate_)
+    {
+        HMODULE dcomp = LoadLibraryW(L"dcomp.dll");
+        if (dcomp) dcompCreate_ = GetProcAddress(dcomp, "DCompositionCreateDevice");
+    }
+    if (!d3dCreate_)
+    {
+        HMODULE d3d = LoadLibraryW(L"d3d11.dll");
+        if (d3d) d3dCreate_ = GetProcAddress(d3d, "D3D11CreateDevice");
+    }
+    if (!dcompCreate_ || !d3dCreate_)
+    {
+        LOG_WARN("dcomp.dll / d3d11.dll not available.");
+        return false;
+    }
+
+    const auto create = reinterpret_cast<D3DCreateFn>(reinterpret_cast<void*>(d3dCreate_));
+    const D3D_FEATURE_LEVEL levels[] = {
+        D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_10_1, D3D_FEATURE_LEVEL_10_0
+    };
+    D3D_FEATURE_LEVEL got{};
+    HRESULT hr = create(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, D3D11_CREATE_DEVICE_BGRA_SUPPORT, levels, 4,
+                        D3D11_SDK_VERSION, d3d_.put(), &got, nullptr);
+    if (hr == E_INVALIDARG) // pre-11.1 runtime does not know FEATURE_LEVEL_11_1
+        hr = create(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, D3D11_CREATE_DEVICE_BGRA_SUPPORT, levels + 1, 3,
+                    D3D11_SDK_VERSION, d3d_.put(), &got, nullptr);
+    if (FAILED(hr))
+    {
+        LOG_WARN("D3D11CreateDevice failed (0x%08lX)", static_cast<unsigned long>(hr));
+        return false;
+    }
+    hr = d3d_->QueryInterface(__uuidof(IDXGIDevice), reinterpret_cast<void**>(dxgiDev_.put()));
+    if (FAILED(hr)) return false;
+
+    ComPtr<IDXGIAdapter> adapter;
+    if (FAILED(dxgiDev_->GetAdapter(adapter.put()))) return false;
+    if (FAILED(adapter->GetParent(__uuidof(IDXGIFactory2), reinterpret_cast<void**>(dxgiFac_.put())))) return false;
+
+    hr = factory1_->CreateDevice(dxgiDev_.get(), d2dDev_.put());
+    if (FAILED(hr))
+    {
+        LOG_WARN("ID2D1Factory1::CreateDevice failed (0x%08lX)", static_cast<unsigned long>(hr));
+        return false;
+    }
+    hr = d2dDev_->CreateDeviceContext(D2D1_DEVICE_CONTEXT_OPTIONS_NONE, dc_.put());
+    if (FAILED(hr))
+    {
+        LOG_WARN("CreateDeviceContext failed (0x%08lX)", static_cast<unsigned long>(hr));
+        return false;
+    }
+    rt_ = dc_.get();
+    rt_->SetDpi(96.f, 96.f);
+    rt_->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE); // transparent target: no ClearType
+    D2D1_COLOR_F white{1, 1, 1, 1};
+    if (FAILED(rt_->CreateSolidColorBrush(white, brush_.put()))) return false;
+    LOG_INFO("GPU renderer: D3D11 feature level 0x%X, D2D device context, flip-model swap chain + DirectComposition.",
+             static_cast<unsigned>(got));
+    return true;
+}
+
+bool Gfx::AttachDComp()
+{
+    if (!dxgiDev_ || !hwnd_) return false;
+    const auto create = reinterpret_cast<DCompCreateFn>(reinterpret_cast<void*>(dcompCreate_));
+    HRESULT hr = create(dxgiDev_.get(), __uuidof(IDCompositionDevice), reinterpret_cast<void**>(dcompDev_.put()));
+    if (FAILED(hr))
+    {
+        LOG_WARN("DCompositionCreateDevice failed (0x%08lX)", static_cast<unsigned long>(hr));
+        return false;
+    }
+    hr = dcompDev_->CreateTargetForHwnd(hwnd_, TRUE, dcompTarget_.put());
+    if (FAILED(hr))
+    {
+        LOG_WARN("CreateTargetForHwnd failed (0x%08lX)", static_cast<unsigned long>(hr));
+        return false;
+    }
+    if (FAILED(dcompDev_->CreateVisual(dcompVisual_.put()))) return false;
+    if (swap_ && FAILED(dcompVisual_->SetContent(swap_.get()))) return false;
+    if (FAILED(dcompTarget_->SetRoot(dcompVisual_.get()))) return false;
+    return SUCCEEDED(dcompDev_->Commit());
+}
+
+bool Gfx::RecoverGpu()
+{
+    const ULONGLONG now = GetTickCount64();
+    if (now - lastRecover_ < 1000) return false; // do not hammer a device that is still resetting
+    lastRecover_ = now;
+    LOG_WARN("GPU device lost - recreating the renderer.");
+    ReleaseGpu();
+    w_ = h_ = 0;
+    if (!InitGpu() || !AttachDComp()) return false;
+    deviceLost_ = false;
+    return true;
+}
+
+bool Gfx::ResizeGpu(int w, int h)
+{
+    if (deviceLost_ && !RecoverGpu()) return false;
+    if (w == w_ && h == h_ && swap_ && target_) return true;
+
+    dc_->SetTarget(nullptr);
+    target_.reset();
+
+    if (!swap_)
+    {
+        DXGI_SWAP_CHAIN_DESC1 d{};
+        d.Width = static_cast<UINT>(w);
+        d.Height = static_cast<UINT>(h);
+        d.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        d.SampleDesc.Count = 1;
+        d.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+        d.BufferCount = 2;
+        d.Scaling = DXGI_SCALING_STRETCH; // the only scaling mode composition swap chains accept
+        d.SwapEffect = DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;
+        d.AlphaMode = DXGI_ALPHA_MODE_PREMULTIPLIED; // per-pixel transparency
+        d.Flags = kSwapFlags;
+        ComPtr<IDXGISwapChain1> sc1;
+        HRESULT hr = dxgiFac_->CreateSwapChainForComposition(dxgiDev_.get(), &d, nullptr, sc1.put());
+        if (FAILED(hr))
+        {
+            LOG_ERROR("CreateSwapChainForComposition failed (0x%08lX)", static_cast<unsigned long>(hr));
+            deviceLost_ = true;
+            return false;
+        }
+        hr = sc1->QueryInterface(__uuidof(IDXGISwapChain2), reinterpret_cast<void**>(swap_.put()));
+        if (FAILED(hr))
+        {
+            LOG_ERROR("IDXGISwapChain2 unavailable (0x%08lX)", static_cast<unsigned long>(hr));
+            deviceLost_ = true;
+            return false;
+        }
+        swap_->SetMaximumFrameLatency(1); // one frame in flight: lowest latency, the frames are tiny anyway
+        latencyWait_.reset(swap_->GetFrameLatencyWaitableObject());
+        if (dcompVisual_ && dcompDev_)
+        {
+            dcompVisual_->SetContent(swap_.get());
+            dcompDev_->Commit();
+        }
+    }
+    else
+    {
+        const HRESULT hr = swap_->ResizeBuffers(0, static_cast<UINT>(w), static_cast<UINT>(h), DXGI_FORMAT_UNKNOWN,
+                                                kSwapFlags);
+        if (FAILED(hr))
+        {
+            LOG_WARN("ResizeBuffers failed (0x%08lX)", static_cast<unsigned long>(hr));
+            deviceLost_ = true;
+            return false;
+        }
+    }
+
+    ComPtr<IDXGISurface> surf;
+    HRESULT hr = swap_->GetBuffer(0, __uuidof(IDXGISurface), reinterpret_cast<void**>(surf.put()));
+    if (FAILED(hr))
+    {
+        deviceLost_ = true;
+        return false;
+    }
+    D2D1_BITMAP_PROPERTIES1 bp{};
+    bp.pixelFormat = D2D1_PIXEL_FORMAT{DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED};
+    bp.dpiX = bp.dpiY = 96.f;
+    bp.bitmapOptions = static_cast<D2D1_BITMAP_OPTIONS>(
+        static_cast<UINT>(D2D1_BITMAP_OPTIONS_TARGET) | static_cast<UINT>(D2D1_BITMAP_OPTIONS_CANNOT_DRAW));
+    hr = dc_->CreateBitmapFromDxgiSurface(surf.get(), &bp, target_.put());
+    if (FAILED(hr))
+    {
+        LOG_ERROR("CreateBitmapFromDxgiSurface failed (0x%08lX)", static_cast<unsigned long>(hr));
+        deviceLost_ = true;
+        return false;
+    }
+    dc_->SetTarget(target_.get());
+    w_ = w;
+    h_ = h;
+    winW_ = -1; // force the window to be resized to match on the next Present
+    LOG_INFO("Overlay surface %dx%d (GPU)", w, h);
+    return true;
+}
+
+bool Gfx::PresentGpu(HWND hwnd, int x, int y)
+{
+    if (!swap_) return false;
+    if (x != winX_ || y != winY_ || w_ != winW_ || h_ != winH_)
+    {
+        // The composition surface has no window bitmap, so the window itself just has to cover the game.
+        SetWindowPos(hwnd, HWND_TOPMOST, x, y, w_, h_, SWP_NOACTIVATE);
+        winX_ = x;
+        winY_ = y;
+        winW_ = w_;
+        winH_ = h_;
+    }
+    const HRESULT hr = swap_->Present(vsync_ ? 1 : 0, 0);
+    if (hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_RESET)
+    {
+        deviceLost_ = true;
+        return false;
+    }
+    return SUCCEEDED(hr);
+}
+
+#endif // ESP_GPU_GFX
+
+bool Gfx::Attach(HWND hwnd)
+{
+#ifdef ESP_GPU_GFX
+    if (!gpu_) return false;
+    hwnd_ = hwnd;
+    // A layered window only shows its DirectComposition content once an alpha has been set (Windows 8+).
+    SetLayeredWindowAttributes(hwnd, 0, 255, LWA_ALPHA);
+    if (!AttachDComp())
+    {
+        hwnd_ = nullptr;
+        return false;
+    }
+    return true;
+#else
+    (void)hwnd;
+    return false;
+#endif
+}
+
+void Gfx::WaitFrame()
+{
+#ifdef ESP_GPU_GFX
+    if (gpu_ && latencyWait_.valid()) WaitForSingleObjectEx(latencyWait_.get(), 100, TRUE);
+#endif
+}
+
+// ------------------------------------------------------------------------------------------ frame
+
 void Gfx::Begin(Col clear)
 {
+#ifdef ESP_GPU_GFX
+    if (gpu_)
+    {
+        rt_->BeginDraw();
+        D2D1_MATRIX_3X2_F id = D2D1::Matrix3x2F::Identity();
+        rt_->SetTransform(&id);
+        D2D1_COLOR_F c = ToD2D(clear);
+        rt_->Clear(&c);
+        layerOn_ = false;
+        if (opacity_ < 0.995f)
+        {
+            // Global overlay opacity < 100%: draw the whole frame inside one layer with that opacity.
+            D2D1_LAYER_PARAMETERS1 lp{};
+            lp.contentBounds = D2D1_RECT_F{-FLT_MAX, -FLT_MAX, FLT_MAX, FLT_MAX};
+            lp.maskTransform = D2D1::Matrix3x2F::Identity();
+            lp.maskAntialiasMode = D2D1_ANTIALIAS_MODE_PER_PRIMITIVE;
+            lp.opacity = std::max(0.f, opacity_);
+            lp.layerOptions = D2D1_LAYER_OPTIONS1_NONE;
+            dc_->PushLayer(&lp, nullptr);
+            layerOn_ = true;
+        }
+        return;
+    }
+#endif
     RECT rc{0, 0, w_, h_};
-    rt_->BindDC(memDc_, &rc);
+    dcrt_->BindDC(memDc_, &rc);
     rt_->BeginDraw();
     D2D1_MATRIX_3X2_F id = D2D1::Matrix3x2F::Identity();
     rt_->SetTransform(&id);
@@ -175,12 +528,31 @@ void Gfx::Begin(Col clear)
 
 bool Gfx::End()
 {
+#ifdef ESP_GPU_GFX
+    if (gpu_)
+    {
+        if (layerOn_)
+        {
+            rt_->PopLayer();
+            layerOn_ = false;
+        }
+        const HRESULT hr = rt_->EndDraw();
+        if (hr == static_cast<HRESULT>(D2DERR_RECREATE_TARGET))
+        {
+            LOG_WARN("D2D device lost - will recreate.");
+            deviceLost_ = true;
+            return false;
+        }
+        return SUCCEEDED(hr);
+    }
+#endif
     HRESULT hr = rt_->EndDraw();
     if (hr == static_cast<HRESULT>(D2DERR_RECREATE_TARGET))
     {
         LOG_WARN("D2D render target lost - recreating.");
         w_ = h_ = 0; // force Resize() to rebuild everything
-        rt_.reset();
+        dcrt_.reset();
+        rt_ = nullptr;
         return false;
     }
     return SUCCEEDED(hr);
@@ -188,11 +560,16 @@ bool Gfx::End()
 
 bool Gfx::Present(HWND hwnd, int x, int y, float opacity)
 {
+#ifdef ESP_GPU_GFX
+    if (gpu_) return PresentGpu(hwnd, x, y);
+#endif
     POINT dst{x, y}, src{0, 0};
     SIZE sz{w_, h_};
     BLENDFUNCTION bf{AC_SRC_OVER, 0, static_cast<BYTE>(std::clamp(opacity, 0.f, 1.f) * 255.f + 0.5f), AC_SRC_ALPHA};
     return UpdateLayeredWindow(hwnd, nullptr, &dst, &sz, memDc_, &src, 0, &bf, ULW_ALPHA) != 0;
 }
+
+// ------------------------------------------------------------------------------------------ primitives
 
 void Gfx::SetBrush(Col c)
 {
@@ -251,7 +628,7 @@ void Gfx::FillCircle(float x, float y, float r, Col c)
 void Gfx::FillTriangle(float x1, float y1, float x2, float y2, float x3, float y3, Col c)
 {
     ComPtr<ID2D1PathGeometry> g;
-    if (FAILED(factory_->CreatePathGeometry(g.put()))) return;
+    if (FAILED(Fac()->CreatePathGeometry(g.put()))) return;
     ComPtr<ID2D1GeometrySink> sink;
     if (FAILED(g->Open(sink.put()))) return;
     sink->BeginFigure(D2D1_POINT_2F{x1, y1}, D2D1_FIGURE_BEGIN_FILLED);
@@ -292,40 +669,62 @@ void Gfx::PushClip(float x, float y, float w, float h)
 
 void Gfx::PopClip() { rt_->PopAxisAlignedClip(); }
 
-// align: 0 left (text starts at x), 1 centered on x, 2 right edge at x. The layout rect is 400 px wide.
-void Gfx::DrawStr(const std::wstring& ws, float x, float y, float w, Font f, Col c, int align, bool shadow)
+// ------------------------------------------------------------------------------------------ text
+
+// DrawText() builds a fresh IDWriteTextLayout on every call. Labels (names, counts, enchantments) repeat from
+// frame to frame, so the layouts are cached by (font, alignment, text) and drawn with DrawTextLayout().
+IDWriteTextLayout* Gfx::Layout(const std::string& s, Font f, int align)
 {
-    if (ws.empty()) return;
-    float left = align == 0 ? x : align == 1 ? x - w * 0.5f : x - w;
-    IDWriteTextFormat* fmt = fmt_[static_cast<int>(f)][align].get();
+    auto& m = layouts_[static_cast<int>(f)][align];
+    auto it = m.find(s);
+    if (it != m.end()) return it->second.get();
+    if (m.size() >= kLayoutCacheMax) m.clear();
+    const std::wstring ws = ToWide(s);
+    ComPtr<IDWriteTextLayout> l;
+    if (FAILED(dw_->CreateTextLayout(ws.c_str(), static_cast<UINT32>(ws.size()),
+                                     fmt_[static_cast<int>(f)][align].get(), 400.f, 40.f, l.put())))
+        return nullptr;
+    IDWriteTextLayout* raw = l.get();
+    m.emplace(s, std::move(l));
+    return raw;
+}
+
+// align: 0 left (text starts at x), 1 centered on x, 2 right edge at x. The layout box is 400 px wide.
+void Gfx::DrawStr(const std::string& s, float x, float y, float w, Font f, Col c, int align, bool shadow)
+{
+    if (s.empty()) return;
+    IDWriteTextLayout* layout = Layout(s, f, align);
+    if (!layout) return;
+    const float left = align == 0 ? x : align == 1 ? x - w * 0.5f : x - w;
     if (shadow)
     {
         SetBrush(Col{0, 0, 0, 0.85f * c.a});
-        D2D1_RECT_F rs = RectF(left + 1, y + 1, w, 40);
-        rt_->DrawText(ws.c_str(), static_cast<UINT32>(ws.size()), fmt, &rs, brush_.get());
+        rt_->DrawTextLayout(D2D1_POINT_2F{left + 1, y + 1}, layout, brush_.get(), D2D1_DRAW_TEXT_OPTIONS_NONE);
     }
     SetBrush(c);
-    D2D1_RECT_F r = RectF(left, y, w, 40);
-    rt_->DrawText(ws.c_str(), static_cast<UINT32>(ws.size()), fmt, &r, brush_.get());
+    rt_->DrawTextLayout(D2D1_POINT_2F{left, y}, layout, brush_.get(), D2D1_DRAW_TEXT_OPTIONS_NONE);
 }
 
 void Gfx::Text(const std::string& s, float x, float y, Font f, Col c, bool sh)
 {
-    DrawStr(ToWide(s), x, y, 400.f, f, c, 0, sh);
+    DrawStr(s, x, y, 400.f, f, c, 0, sh);
 }
 
 void Gfx::TextCentered(const std::string& s, float cx, float y, Font f, Col c, bool sh)
 {
-    DrawStr(ToWide(s), cx, y, 400.f, f, c, 1, sh);
+    DrawStr(s, cx, y, 400.f, f, c, 1, sh);
 }
 
 void Gfx::TextRight(const std::string& s, float rx, float y, Font f, Col c, bool sh)
 {
-    DrawStr(ToWide(s), rx, y, 400.f, f, c, 2, sh);
+    DrawStr(s, rx, y, 400.f, f, c, 2, sh);
 }
 
 float Gfx::TextWidth(const std::string& s, Font f)
 {
+    auto& cache = widths_[static_cast<int>(f)];
+    auto it = cache.find(s);
+    if (it != cache.end()) return it->second;
     std::wstring ws = ToWide(s);
     if (ws.empty()) return 0.f;
     ComPtr<IDWriteTextLayout> layout;
@@ -333,5 +732,7 @@ float Gfx::TextWidth(const std::string& s, Font f)
                                      1000.f, 40.f, layout.put()))) return 0.f;
     DWRITE_TEXT_METRICS m{};
     layout->GetMetrics(&m);
+    if (cache.size() >= kWidthCacheMax) cache.clear();
+    cache.emplace(s, m.widthIncludingTrailingWhitespace);
     return m.widthIncludingTrailingWhitespace;
 }

@@ -29,11 +29,21 @@ public:
 
     WorldSnapshot Predict(Clock::time_point now, bool enable)
     {
-        WorldSnapshot out = cur_;
-        if (!enable || !havePrev_) return out;
+        WorldSnapshot out;
+        PredictInto(now, enable, out);
+        return out;
+    }
+
+    // Same as Predict(), but writes into a caller-owned snapshot. Copy-assignment reuses the vectors' and strings'
+    // existing capacity, so in steady state this allocates nothing (Predict() deep-copies every item's strings
+    // - name, enchants, NBT text - on every rendered frame).
+    void PredictInto(Clock::time_point now, bool enable, WorldSnapshot& out)
+    {
+        out = cur_;
+        if (!enable || !havePrev_) return;
 
         const double dtSamples = std::chrono::duration<double>(cur_.arrived - prev_.arrived).count();
-        if (dtSamples < 0.004 || dtSamples > 0.5) return out; // stale / bursty -> do not extrapolate
+        if (dtSamples < 0.004 || dtSamples > 0.5) return; // stale / bursty -> do not extrapolate
         const double ahead = std::fmin(0.10, std::fmax(0.0, std::chrono::duration<double>(now - cur_.arrived).count()));
         const double f = ahead / dtSamples;
 
@@ -62,7 +72,6 @@ public:
             auto it = prevByName_.find(pl.name);
             if (it != prevByName_.end()) extrap(pl, *it->second);
         }
-        return out;
     }
 
 private:

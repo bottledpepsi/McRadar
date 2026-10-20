@@ -1,16 +1,16 @@
-// Gfx.h - Direct2D + DirectWrite drawing onto a per-pixel-alpha layered window.
+// Gfx.h - Direct2D + DirectWrite drawing for the transparent overlay window. Two interchangeable backends:
 //
-// Why this API: an external overlay must be transparent and click-through, and must not inject into
-// (or hook) the game's renderer. A layered window + UpdateLayeredWindow gives true per-pixel alpha
-// over any game window. Direct2D renders anti-aliased primitives and DirectWrite renders text into a
-// 32-bit premultiplied-alpha DIB section through a GDI-compatible DC render target; the finished DIB
-// is handed to the window manager in one call. It is light on CPU/GPU, has no swap chain to
-// configure, and only needs d2d1/dwrite (present on every Windows 7+ machine).
+//  GPU (default when available): a Direct3D 11 device, a flip-model DXGI swap chain with premultiplied alpha that
+//    is bound to the overlay window through DirectComposition, and a Direct2D *device context* that draws straight
+//    into the swap chain's back buffer. Nothing is copied through system memory: no full-frame clear, no DIB
+//    read-back, no UpdateLayeredWindow upload - the per-frame cost no longer scales with the window's pixel count.
+//    Frame pacing uses the swap chain's frame-latency waitable object (replaces DwmFlush).
 //
-// Double buffering: all drawing goes to the off-screen DIB (the back buffer); Present() publishes the
-// completed frame atomically via UpdateLayeredWindow, so the screen never shows a half-drawn frame.
-// VSync: UpdateLayeredWindow has no swap interval, so frame pacing is done by the caller with
-// DwmFlush() right after Present() - it blocks until the desktop compositor's next vblank-aligned pass.
+//  Legacy (fallback / --gdi): Direct2D renders through a GDI-compatible DC render target into a 32-bit
+//    premultiplied-alpha DIB, handed to the window manager with UpdateLayeredWindow. Needs only d2d1/dwrite, but
+//    does three full-surface passes per frame (clear, EndDraw copy into the DIB, UpdateLayeredWindow upload).
+//
+// The drawing API below is identical for both, so EspRenderer / ConfigUi do not care which one is active.
 #pragma once
 #include "Platform.h"
 #include "Image.h"
@@ -22,6 +22,17 @@
 #include <dwrite.h>
 #include <string>
 #include <unordered_map>
+
+// The GPU backend needs these headers (all present in mingw-w64 and the Windows SDK). If any is missing the
+// project still builds and simply uses the legacy backend. The libraries are loaded at run time (LoadLibrary),
+// so no extra link flags are required.
+#if __has_include(<d2d1_1.h>) && __has_include(<d3d11.h>) && __has_include(<dxgi1_3.h>) && __has_include(<dcomp.h>)
+#define ESP_GPU_GFX 1
+#include <d2d1_1.h>
+#include <d3d11.h>
+#include <dxgi1_3.h>
+#include <dcomp.h>
+#endif
 
 struct Col
 {
@@ -39,14 +50,27 @@ public:
     Gfx(const Gfx&) = delete;
     Gfx& operator=(const Gfx&) = delete;
 
-    bool Init(); // factories, text formats
-    bool Resize(int w, int h); // (re)create the DIB + render target binding
+    // factories, text formats and (if allowGpu) the D3D11/D2D device stack. Falls back to the legacy backend
+    // by itself when the GPU stack cannot be created.
+    bool Init(bool allowGpu = true);
+    bool IsGpu() const { return gpu_; }
+    // GPU backend: bind the swap chain to the overlay window (DirectComposition). The window must have been created
+    // with WS_EX_NOREDIRECTIONBITMAP. Returns false if that fails (caller recreates the window and calls ForceLegacy()).
+    bool Attach(HWND hwnd);
+    bool ForceLegacy(); // drop the GPU stack, use the DIB / UpdateLayeredWindow path
+
+    bool Resize(int w, int h); // (re)create the render surface; false => skip this frame
     int Width() const { return w_; }
     int Height() const { return h_; }
 
-    void Begin(Col clear); // BindDC + BeginDraw + Clear
-    bool End(); // EndDraw; false => render target lost (recreated on next Resize)
-    // Publishes the frame: screen position x,y, global opacity 0..1 (OverlayOpacity setting).
+    // GPU backend: block until the compositor can accept another frame (call at the START of a frame). No-op otherwise.
+    void WaitFrame();
+    void SetOpacity(float o) { opacity_ = o; } // global overlay opacity 0..1 (applied at Begin() in the GPU backend)
+    void SetVSync(bool v) { vsync_ = v; } // GPU backend: Present sync interval 1 (on) or 0 (off)
+
+    void Begin(Col clear); // BeginDraw + Clear
+    bool End(); // EndDraw; false => render target lost (recreated on a later Resize)
+    // Publishes the frame at screen position x,y. `opacity` is used by the legacy backend only (GPU uses SetOpacity).
     bool Present(HWND hwnd, int x, int y, float opacity);
 
     // ---- primitives (device-independent pixels == screen pixels; the target runs at 96 dpi) ----
@@ -71,19 +95,57 @@ public:
     float TextWidth(const std::string& s, Font f);
 
 private:
-    bool CreateRenderTarget();
-    void DrawStr(const std::wstring& ws, float x, float y, float w, Font f, Col c, int align, bool shadow);
+    static constexpr int kFontCount = static_cast<int>(Font::Count);
+
+    bool CreateRenderTarget(); // legacy DC render target
+    void DrawStr(const std::string& s, float x, float y, float w, Font f, Col c, int align, bool shadow);
+    IDWriteTextLayout* Layout(const std::string& s, Font f, int align); // cached 400x40 layout
     void SetBrush(Col c);
     void FreeSurface();
+    ID2D1Factory* Fac() const;
 
-    ComPtr<ID2D1Factory> factory_;
-    ComPtr<ID2D1DCRenderTarget> rt_;
+    ComPtr<ID2D1Factory> factory_; // legacy-only factory (when no ID2D1Factory1 is available)
+    ComPtr<ID2D1DCRenderTarget> dcrt_; // legacy backend render target
+    ID2D1RenderTarget* rt_ = nullptr; // non-owning: whichever backend is active; every primitive draws through it
     ComPtr<ID2D1SolidColorBrush> brush_; // single scratch brush, recoloured per draw call
     ComPtr<IDWriteFactory> dw_;
-    ComPtr<IDWriteTextFormat> fmt_[static_cast<int>(Font::Count)][3]; // [font][0=left 1=center 2=right]
+    ComPtr<IDWriteTextFormat> fmt_[kFontCount][3]; // [font][0=left 1=center 2=right]
+    std::unordered_map<std::string, ComPtr<IDWriteTextLayout>> layouts_[kFontCount][3]; // text layout cache
+    std::unordered_map<std::string, float> widths_[kFontCount]; // TextWidth cache
 
     std::unordered_map<uint64_t, ComPtr<ID2D1Bitmap>> bitmaps_;
-    HDC memDc_ = nullptr;
-    HBITMAP dib_ = nullptr, oldBmp_ = nullptr;
+    HDC memDc_ = nullptr; // legacy
+    HBITMAP dib_ = nullptr, oldBmp_ = nullptr; // legacy
     int w_ = 0, h_ = 0;
+    bool gpu_ = false;
+    float opacity_ = 1.f;
+    bool vsync_ = true;
+
+#ifdef ESP_GPU_GFX
+    bool InitGpu();
+    bool AttachDComp();
+    bool ResizeGpu(int w, int h);
+    bool PresentGpu(HWND hwnd, int x, int y);
+    bool RecoverGpu();
+    void ReleaseGpu();
+
+    ComPtr<ID2D1Factory1> factory1_;
+    ComPtr<ID3D11Device> d3d_;
+    ComPtr<IDXGIDevice> dxgiDev_;
+    ComPtr<IDXGIFactory2> dxgiFac_;
+    ComPtr<ID2D1Device> d2dDev_;
+    ComPtr<ID2D1DeviceContext> dc_;
+    ComPtr<ID2D1Bitmap1> target_; // the swap chain's back buffer as a D2D bitmap
+    ComPtr<IDXGISwapChain2> swap_;
+    UniqueHandle latencyWait_;
+    ComPtr<IDCompositionDevice> dcompDev_;
+    ComPtr<IDCompositionTarget> dcompTarget_;
+    ComPtr<IDCompositionVisual> dcompVisual_;
+    FARPROC dcompCreate_ = nullptr; // DCompositionCreateDevice
+    FARPROC d3dCreate_ = nullptr; // D3D11CreateDevice
+    HWND hwnd_ = nullptr;
+    bool deviceLost_ = false, layerOn_ = false;
+    ULONGLONG lastRecover_ = 0;
+    int winX_ = -32768, winY_ = -32768, winW_ = -1, winH_ = -1; // last window rect applied by Present
+#endif
 };

@@ -11,6 +11,10 @@
 
 using namespace std::chrono_literals;
 
+#ifndef WS_EX_NOREDIRECTIONBITMAP
+#define WS_EX_NOREDIRECTIONBITMAP 0x00200000L
+#endif
+
 namespace
 {
     constexpr wchar_t kClass[] = L"ExternalEspOverlay";
@@ -51,8 +55,12 @@ bool EspOverlay::CreateOverlayWindow()
     // WS_EX_TOPMOST     : stays above the game
     // WS_EX_TOOLWINDOW  : no taskbar button / Alt-Tab entry
     // WS_EX_NOACTIVATE  : never steals keyboard focus from the game (removed while the config window is open)
-    hwnd_ = CreateWindowExW(WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
-                            kClass, L"external-esp", WS_POPUP, 0, 0, 1, 1, nullptr, nullptr, wc.hInstance, this);
+    // WS_EX_NOREDIRECTIONBITMAP : (GPU renderer only) no GDI redirection surface - the window's pixels come from the
+    //                             DirectComposition swap chain instead of UpdateLayeredWindow
+    DWORD exStyle = WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE;
+    if (gfx_.IsGpu()) exStyle |= WS_EX_NOREDIRECTIONBITMAP;
+    hwnd_ = CreateWindowExW(exStyle, kClass, L"external-esp", WS_POPUP, 0, 0, 1, 1, nullptr, nullptr, wc.hInstance,
+                            this);
     if (!hwnd_)
     {
         LOG_ERROR("CreateWindowEx failed (%lu)", static_cast<unsigned long>(GetLastError()));
@@ -117,8 +125,12 @@ LRESULT EspOverlay::OnMessage(HWND h, UINT m, WPARAM w, LPARAM l)
         return 0;
     case WM_CLOSE: DestroyWindow(h);
         return 0;
-    case WM_DESTROY: quit_ = true;
-        PostQuitMessage(0);
+    case WM_DESTROY:
+        if (!suppressQuit_)
+        {
+            quit_ = true;
+            PostQuitMessage(0);
+        }
         return 0;
     default: break;
     }
@@ -277,12 +289,30 @@ void EspOverlay::Pace(Clock::time_point frameStart)
 int EspOverlay::Run()
 {
     settings_.Load();
-    if (!gfx_.Init())
+    if (!gfx_.Init(!opt_.legacyGfx))
     {
         LOG_ERROR("Direct2D/DirectWrite initialisation failed.");
         return 1;
     }
     if (!CreateOverlayWindow()) return 1;
+    if (gfx_.IsGpu() && !gfx_.Attach(hwnd_))
+    {
+        // The window was created for the GPU renderer (no redirection bitmap); the legacy one needs a normal
+        // layered window, so build it again.
+        LOG_WARN("DirectComposition attach failed - falling back to the legacy layered-window renderer.");
+        suppressQuit_ = true;
+        DestroyWindow(hwnd_);
+        suppressQuit_ = false;
+        hwnd_ = nullptr;
+        if (!gfx_.ForceLegacy() || !CreateOverlayWindow())
+        {
+            LOG_ERROR("Legacy renderer initialisation failed.");
+            return 1;
+        }
+    }
+    LOG_INFO("Renderer: %s", gfx_.IsGpu()
+                                 ? "GPU (D3D11 flip swap chain + DirectComposition + Direct2D device context)"
+                                 : "legacy (DIB + UpdateLayeredWindow)");
     if (!opt_.demo && !udp_.Start()) LOG_ERROR("Agent data will not be received (UDP listener failed).");
     SkinCache::Start(); // friend avatars (background downloads)
     timeBeginPeriod(1); // 1 ms sleep granularity for the frame limiter
@@ -343,7 +373,9 @@ void EspOverlay::RenderFrame(const RECT& r, bool /*gameFocused*/)
 {
     const int w = r.right - r.left, h = r.bottom - r.top;
     if (!gfx_.Resize(w, h)) return;
+    gfx_.WaitFrame(); // GPU renderer: pace to the compositor here, before sampling any state for this frame
     const auto now = Clock::now();
+    const auto cpuStart = now;
 
     // ---- 1. newest data -> smoother (the UDP thread only ever swaps a pointer; we never block on it) ----
     if (opt_.demo)
@@ -362,8 +394,9 @@ void EspOverlay::RenderFrame(const RECT& r, bool /*gameFocused*/)
         lastSeq_ = sp->seq;
         smoother_.Push(*sp);
     }
-    WorldSnapshot snap;
-    if (smoother_.HasData()) snap = smoother_.Predict(now, settings_.smoothing);
+    WorldSnapshot& snap = snap_;
+    if (smoother_.HasData()) smoother_.PredictInto(now, settings_.smoothing, snap);
+    else snap = WorldSnapshot{};
     const bool stale = !opt_.demo && (udp_.LastPacketTime() == Clock::time_point{} || now - udp_.LastPacketTime() >
         1500ms);
 
@@ -411,6 +444,8 @@ void EspOverlay::RenderFrame(const RECT& r, bool /*gameFocused*/)
     // ---- 3. draw into the off-screen surface ----
     // While the config window is open the whole surface is given alpha 1/255: invisible, but hit-testable,
     // so clicks outside the panel do not leak through into the game.
+    gfx_.SetOpacity(presets::OverlayOpacity[settings_.overlayOpacityIdx]);
+    gfx_.SetVSync(settings_.vsync);
     gfx_.Begin(configOpen_ ? Col{0, 0, 0, 1.f / 255.f} : Col{0, 0, 0, 0});
     if (visible_ && haveCam)
     {
@@ -423,6 +458,8 @@ void EspOverlay::RenderFrame(const RECT& r, bool /*gameFocused*/)
     if (now - fpsWindowStart_ >= 500ms)
     {
         fps_ = fpsFrames_ / std::chrono::duration<float>(now - fpsWindowStart_).count();
+        cpuMs_ = fpsFrames_ > 0 ? cpuAccumMs_ / static_cast<float>(fpsFrames_) : 0.f;
+        cpuAccumMs_ = 0;
         fpsFrames_ = 0;
         fpsWindowStart_ = now;
     }
@@ -436,7 +473,8 @@ void EspOverlay::RenderFrame(const RECT& r, bool /*gameFocused*/)
     }
     else
     {
-        std::snprintf(line, sizeof line, "external-esp  |  %s  |  %.0f fps", state, fps_);
+        std::snprintf(line, sizeof line, "external-esp  |  %s  |  %.0f fps  |  %.2f ms cpu  |  %s", state, fps_, cpuMs_,
+                      gfx_.IsGpu() ? "gpu" : "gdi");
         gfx_.Text(line, 10, 8, Font::Ui, Col{0.80f, 0.85f, 1.f, 0.95f}, true);
     }
     std::string status = sup_.Status();
@@ -465,5 +503,8 @@ void EspOverlay::RenderFrame(const RECT& r, bool /*gameFocused*/)
 
     if (!gfx_.End()) return; // render target lost; Resize() rebuilds it next frame
     gfx_.Present(hwnd_, r.left, r.top, presets::OverlayOpacity[settings_.overlayOpacityIdx]);
-    if (settings_.vsync) DwmFlush(); // VSync: wait for the compositor's next refresh-aligned pass
+    cpuAccumMs_ += std::chrono::duration<float, std::milli>(Clock::now() - cpuStart).count();
+    // Legacy renderer: UpdateLayeredWindow has no swap interval, so wait for the compositor's next pass. The GPU
+    // renderer is paced by Present() + the swap chain's frame-latency waitable object (Gfx::WaitFrame).
+    if (settings_.vsync && !gfx_.IsGpu()) DwmFlush();
 }

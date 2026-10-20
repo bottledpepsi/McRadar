@@ -16,4 +16,5 @@ struct AppOptions
     int agentHz = 60; // snapshot rate requested from the agent
     bool screenOverlay = false; // cover the whole primary monitor instead of tracking the game window
     bool openConfig = false; // open the config window as soon as the overlay is visible
+    bool legacyGfx = false; // --gdi: force the old DIB + UpdateLayeredWindow renderer (default: GPU swap chain)
 };

@@ -3,7 +3,7 @@
 //   Minecraft JVM <--(JVM Attach API)-- esp-agent.jar --UDP 127.0.0.1:47615--> UdpListener --> EspOverlay (D2D layered window)
 //
 // Usage:
-//   mcesp [--demo] [--pid N] [--port N] [--java PATH] [--jar PATH] [--no-inject] [--open-config] [--screen] [--list]
+//   mcesp [--demo] [--pid N] [--port N] [--java PATH] [--jar PATH] [--no-inject] [--open-config] [--screen] [--gdi] [--list]
 //   Insert = config window, Delete = toggle ESP, hold End = exit (all rebindable in the HOTKEYS tab).
 //
 // Scope: written for single-player / LAN worlds you control (two accounts on your own machine) -
@@ -26,7 +26,7 @@ namespace
     {
         std::puts(
             "external-esp (C++)\n"
-            "  mcesp [--demo] [--pid N] [--port N] [--java PATH] [--jar PATH] [--no-inject] [--open-config] [--screen] [--list]\n"
+            "  mcesp [--demo] [--pid N] [--port N] [--java PATH] [--jar PATH] [--no-inject] [--open-config] [--screen] [--gdi] [--list]\n"
             "\n"
             "  --demo       synthetic players (test the overlay/config UI without Minecraft)\n"
             "  --pid N      attach to this java(w).exe PID (two Minecraft clients on one PC)\n"
@@ -36,6 +36,7 @@ namespace
             "  --no-inject  do not attach automatically (start the game with -javaagent:esp-agent.jar=port=47615)\n"
             "  --open-config  open the config window right away\n"
             "  --screen     cover the whole primary monitor instead of tracking the game window\n"
+            "  --gdi        use the legacy CPU renderer (layered window) instead of the GPU swap chain\n"
             "  --list       list running Minecraft/java processes and exit\n"
             "\nKeys: Insert config | Delete toggle | hold End exit");
     }
@@ -62,6 +63,7 @@ int main(int argc, char** argv)
         else if (a == "--list") list = true;
         else if (a == "--open-config") opt.openConfig = true;
         else if (a == "--screen") opt.screenOverlay = true;
+        else if (a == "--gdi") opt.legacyGfx = true;
         else if (a == "--pid" && i + 1 < argc) opt.pid = static_cast<DWORD>(std::strtoul(argv[++i], nullptr, 10));
         else if (a == "--port" && i + 1 < argc) opt.port = static_cast<uint16_t>(std::strtoul(argv[++i], nullptr, 10));
         else if (a == "--java" && i + 1 < argc) opt.javaPath = argv[++i];
