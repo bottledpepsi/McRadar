@@ -62,4 +62,10 @@ struct WorldSnapshot
     std::string status; // agent status line
     uint64_t seq = 0; // increments per received datagram
     std::chrono::steady_clock::time_point arrived{};
+    // Wire v4: the instant the agent read the game state (its System.nanoTime(), a clock the Smoother maps onto
+    // ours). Lets the overlay ignore UDP / thread-wake-up jitter. Absent (false) for older agents and the demo.
+    bool hasSampleTime = false;
+    int64_t sampleNs = 0;
+    // Wire v4: false = this datagram carries no item list (items are sent at ~10 Hz); keep the previous one.
+    bool hasItems = true;
 };

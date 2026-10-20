@@ -24,7 +24,7 @@ struct InjectorConfig
     std::filesystem::path jarPath; // esp-agent.jar
     std::string javaPath; // optional override
     uint16_t port = 47615;
-    int agentHz = 60; // snapshots/second requested from the agent
+    int agentHz = 120; // snapshots/second requested from the agent
 };
 
 class AgentInjector

@@ -42,17 +42,20 @@ public final class Agent {
                 sock = new DatagramSocket();
                 InetAddress lo = InetAddress.getByAddress(new byte[] {127, 0, 0, 1});
                 Probe probe = new Probe(inst, cfg);
-                long periodMs = Math.max(1, 1000 / cfg.hz);
+                final long periodNs = 1000000000L / cfg.hz;
                 long nextDiscover = 0, backoff = 1500;
+                long next = System.nanoTime();
 
                 while (true) {
                     long t0 = System.currentTimeMillis();
+                    long tSample = System.nanoTime();          // the sample instant, stamped on the wire (T line)
                     Snapshot snap;
                     try {
                         if (!probe.isReady() && t0 >= nextDiscover) {
                             boolean ok = probe.discover();
                             if (ok) backoff = 1500;
                             else { nextDiscover = System.currentTimeMillis() + backoff; backoff = Math.min(backoff * 2, 15000); }
+                            tSample = System.nanoTime();
                         }
                         snap = probe.read();
                     } catch (Throwable t) {
@@ -61,11 +64,21 @@ public final class Agent {
                         Log.info("Error in tick: " + t);
                         probe.reset();
                     }
+                    snap.sampleNs = tSample;
+                    snap.hasSampleTime = true;
                     byte[] data = snap.encode();
                     try { sock.send(new DatagramPacket(data, data.length, lo, cfg.port)); } catch (Throwable ignored) { }
 
-                    long sleep = periodMs - (System.currentTimeMillis() - t0);
-                    if (sleep > 0) Thread.sleep(sleep);
+                    // Slow work goes AFTER the send, in the idle part of the period (see Probe.pollItemsIfDue).
+                    try { probe.pollItemsIfDue(); } catch (Throwable t) { Log.info("Error polling items: " + t); probe.reset(); }
+
+                    // Absolute schedule: sleep jitter does not accumulate, and a late wake-up is made up for by a shorter
+                    // next sleep. The sample instants are stamped, so uneven spacing is harmless to the overlay.
+                    next += periodNs;
+                    long nowNs = System.nanoTime();
+                    if (next < nowNs - 4 * periodNs) next = nowNs;      // fell far behind (GC pause...): resynchronise, no burst
+                    long ms = (next - nowNs) / 1000000L;
+                    if (ms >= 1) Thread.sleep(ms);
                 }
             } catch (InterruptedException ie) {
                 Log.info("Worker interrupted; stopping.");

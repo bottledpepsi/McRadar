@@ -75,6 +75,8 @@ final class Probe {
     private final ItemScanner itemScan = new ItemScanner(this);
     private boolean auxDone;
     private long auxNextTry, lastItemPoll;
+    private double[] lastEye;                 // eye of the last snapshot; pollItemsIfDue() searches around it
+    private boolean itemsDirty = true;       // lastItems changed since it was last put on the wire
     private List<Snapshot.Item> lastItems = new ArrayList<Snapshot.Item>();
     private String exportedCam = "", exportedItems = "";
     private boolean ready;
@@ -689,6 +691,7 @@ final class Probe {
     // ------------------------------------------------------------------ per-tick read
 
     Snapshot read() {
+        lastEye = null;
         Snapshot s = new Snapshot();
         if (!ready) { s.status = status; return s; }
 
@@ -760,21 +763,35 @@ final class Probe {
             ensureAux();
             if (localYawFresh) camScan.observe(eye, s.local.yaw, s.local.pitch);   // never learn from a held (stale) yaw
             s.camera = camScan.read(eye, s.local.yaw);
-            if (now - lastItemPoll >= 100) {                          // items change slowly: 10 Hz is plenty
-                lastItemPoll = now;
-                List<Snapshot.Item> polled = itemScan.poll(eye, 48);
-                if (polled != null) lastItems = polled;                 // null = transient read failure: keep the last frame
-            }
-            s.items.addAll(lastItems);
+            // Items change slowly: they are re-polled at 10 Hz by pollItemsIfDue() AFTER the snapshot was sent, so a slow
+            // poll can never delay a camera sample, and they go on the wire only when they changed (itemsFresh).
+            lastEye = eye;
+            s.itemsFresh = itemsDirty;
+            if (itemsDirty) { s.items.addAll(lastItems); itemsDirty = false; }
             if (!camScan.describe.equals(exportedCam) || !itemScan.describe.equals(exportedItems)) {
                 exportedCam = camScan.describe; exportedItems = itemScan.describe;
                 exportLayout();
             }
         }
         s.status = s.local == null ? "connected, but local player not found (set user=NAME?)"
-                                   : "agent ok: " + s.players.size() + " player(s), " + s.items.size() + " item(s) [" + itemScan.summary() + "]"
+                                   : "agent ok: " + s.players.size() + " player(s), " + lastItems.size() + " item(s) [" + itemScan.summary() + "]"
                                      + (s.camera == null ? ", camera: reconstructing" : (Float.isNaN(s.camera.fov) ? ", camera: exact, FOV: configured" : ", camera+FOV: exact"));
         return s;
+    }
+
+    /**
+     * Re-polls the nearby item entities (10 Hz). Called by the sender thread right after a snapshot went out, so the
+     * (possibly several ms long) entity walk happens in the idle part of the period instead of between reading the
+     * camera and sending it.
+     */
+    void pollItemsIfDue() {
+        double[] eye = lastEye;
+        if (eye == null) return;
+        long now = System.currentTimeMillis();
+        if (now - lastItemPoll < 100) return;
+        lastItemPoll = now;
+        List<Snapshot.Item> polled = itemScan.poll(eye, 48);
+        if (polled != null) { lastItems = polled; itemsDirty = true; }   // null = transient read failure: keep the last frame
     }
 
     /** Runs the second graph search (camera candidates + entity containers) once per discovery. */

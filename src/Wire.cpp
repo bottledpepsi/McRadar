@@ -24,10 +24,12 @@ bool ParseDatagram(const char* data, size_t len, WorldSnapshot& out)
     if (line.rfind("MCRADAR 1", 0) == 0) version = 1;
     else if (line.rfind("MCRADAR 2", 0) == 0) version = 2;
     else if (line.rfind("MCRADAR 3", 0) == 0) version = 3;
+    else if (line.rfind("MCRADAR 4", 0) == 0) version = 4;
     else return false; // not ours
 
     WorldSnapshot snap;
     snap.status = "agent connected";
+    if (version >= 4) snap.hasItems = false; // until an F line says the item list follows
     while (std::getline(in, line))
     {
         if (!line.empty() && line.back() == '\r') line.pop_back();
@@ -38,6 +40,22 @@ bool ParseDatagram(const char* data, size_t len, WorldSnapshot& out)
         if (tag == 'S')
         {
             snap.status = line.substr(2);
+            continue;
+        }
+        if (tag == 'T' && version >= 4)
+        {
+            char* end = nullptr;
+            const long long v = std::strtoll(line.c_str() + 2, &end, 10);
+            if (end && end != line.c_str() + 2)
+            {
+                snap.sampleNs = static_cast<int64_t>(v);
+                snap.hasSampleTime = true;
+            }
+            continue;
+        }
+        if (tag == 'F' && version >= 4)
+        {
+            snap.hasItems = true;
             continue;
         }
 

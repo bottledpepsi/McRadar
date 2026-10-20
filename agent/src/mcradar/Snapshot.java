@@ -33,6 +33,9 @@ final class Snapshot {
     }
 
     String status = "ok";
+    long sampleNs;                 // System.nanoTime() taken just BEFORE the game state was read (the sample instant)
+    boolean hasSampleTime;
+    boolean itemsFresh = true;     // false: the item list is left out (the overlay keeps the last one); sent at ~10 Hz
     Rec local;
     Cam camera;
     final List<Rec> players = new ArrayList<Rec>();
@@ -41,18 +44,23 @@ final class Snapshot {
     static final int MAX_BYTES = 56000;     // stay well under the 64 KB UDP datagram limit
 
     /**
-     * Wire format v3 (UTF-8), one UDP datagram per snapshot. Free text is percent-encoded (no spaces).
-     *   MCRADAR 3
+     * Wire format v4 (UTF-8), one UDP datagram per snapshot. Free text is percent-encoded (no spaces).
+     * v4 = v3 + the T and F lines; the C++ side still reads v1..v3.
+     *   MCRADAR 4
+     *   T <nanoTime>                                                        sample instant (agent's System.nanoTime)
      *   S <status text>
      *   C <x> <y> <z> <yaw> <pitch> <fov|-> <mode>                          camera (optional)
      *   L <name> <x> <y> <z> <yaw|-> <pitch|-> <health|-> <w|-> <h|-> <uuid|->   local player (optional)
      *   P <name> ...same columns...                                         one line per OTHER player
+     *   F 1                                                                 marks that the item list follows (possibly empty);
+     *                                                                       snapshots without it keep the previous items
      *   I <x> <y> <z> <w|-> <h|-> <count> <key> <ench|-> <tags|->           one line per dropped item
      * ("-" = unknown.) Angles in degrees, Minecraft convention: yaw 0 = +Z (south), pitch +90 = straight down.
      */
     byte[] encode() {
         StringBuilder sb = new StringBuilder(512);
-        sb.append("MCRADAR 3\n");
+        sb.append("MCRADAR 4\n");
+        if (hasSampleTime) sb.append("T ").append(sampleNs).append('\n');
         sb.append("S ").append(status.replace('\n', ' ')).append('\n');
         if (camera != null) {
             Cam c = camera;
@@ -61,6 +69,7 @@ final class Snapshot {
         }
         if (local != null) line(sb, 'L', local);
         for (Rec r : players) line(sb, 'P', r);
+        if (itemsFresh) sb.append("F 1\n");
         for (Item it : items) {
             StringBuilder one = new StringBuilder(160);
             one.append("I ").append(String.format(Locale.ROOT, "%.3f %.3f %.3f ", it.x, it.y, it.z))
